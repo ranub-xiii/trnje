@@ -3,6 +3,11 @@
 
 import argparse
 import json
+import sys
+from pathlib import Path
+
+# Make direct execution from any working directory resolve the repository package.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from trnje.local_model import run_local_model
 
