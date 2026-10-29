@@ -2,6 +2,8 @@
 # Read-only environment inventory for Trnje. Creates one sanitized Markdown report.
 set -u
 umask 077
+: "${HOME:=/}"
+: "${PREFIX:=/nonexistent-prefix}"
 
 stamp="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || printf 'unknown-time')"
 out="${TRNJE_INVENTORY_OUT:-./trnje-inventory-${stamp}.md}"
