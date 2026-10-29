@@ -57,6 +57,12 @@ Capture a sanitized, read-only report from the actual Termux session. Include:
 
 Record unavailable checks as `UNKNOWN` or `BLOCKED`, including the exact reason. Redact environment variables and command output that could contain tokens, account identifiers, private paths, or other secrets.
 
+### Current inventory helper
+
+A read-only helper is committed at [`scripts/inventory_termux.sh`](scripts/inventory_termux.sh). Run it from the Trnje repository root in the actual Termux shell with `bash scripts/inventory_termux.sh`. It creates a new, permission-restricted Markdown report in the current directory and refuses to overwrite an existing report. It does not install packages, make network calls, run model inference, or modify Git state. It reports tool availability/version output, memory/storage, model-like file counts and aggregate size (not names), existing Git change counts (not paths), and shell subprocess plus temporary write/read smoke checks. Review the generated report before sharing it; platform metadata can still be identifying. This helper does **not** test Android screen-off survival, the agent/MCP subprocess route, authenticated GitHub/Actions access, model quality, or the comparative coding benchmark.
+
+The current ChatGPT session has no verified direct command-execution path into the user's active Termux shell. Therefore committing and read-back verifying the helper is not evidence that it has run on the device. Its report must be collected from that real environment before the inventory status changes.
+
 ## Common benchmark
 
 Run the same small, deterministic coding task in each candidate environment that is actually available. The task should require reading a small repository, changing one function, adding or adjusting a test, running targeted tests and lint, and producing a final diff plus evidence. Use the same input, test, time/attempt budget, and acceptance criteria.
@@ -105,7 +111,9 @@ Use legitimate options instead: wait for the provider's stated reset, inspect th
 
 ## Evidence status
 
-- Current Termux inventory: **UNKNOWN — fresh output not yet collected**.
+- Inventory helper: **PASS — committed and read back from GitHub** ([script](scripts/inventory_termux.sh), commit `22725c3e2ccdd21931d2db7f81ddcf86c249dad2`). This verifies repository persistence only, not script execution.
+- Current Termux inventory: **UNKNOWN — helper not run in the device shell; no direct Termux execution channel is available in this session**.
+- GitHub Actions availability: **UNKNOWN — code search returned no indexed workflow results and the inventory commit has no reported status contexts; neither observation proves Actions are disabled**.
 - Termux-first benchmark: **UNKNOWN — not run**.
 - Hybrid benchmark: **UNKNOWN — not run**.
 - Separate-host benchmark: **UNKNOWN — availability not established**.
