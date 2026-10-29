@@ -114,7 +114,7 @@ Use legitimate options instead: wait for the provider's stated reset, inspect th
 - Inventory helper: **PASS — committed and read back from GitHub** ([script](scripts/inventory_termux.sh), commit `22725c3e2ccdd21931d2db7f81ddcf86c249dad2`). This verifies repository persistence only, not script execution.
 - Local model adapter on Termux: **PASS — user-provided execution output on 2026-10-29**. `python -m pytest -q`: 6 passed; `python -m compileall -q trnje scripts tests`: exit 0; `python scripts/model_smoke.py`: JSON status `PASS`, process return code 0, expected marker present, smoke exit code 0. The observed generation rate in this run was 13.0 tokens/s. This validates the adapter smoke path, not coding-task completion or reliability.
 - Current Termux inventory: **UNKNOWN — helper has not been run and returned as a report in the available evidence**.
-- GitHub Actions workflow: **ADDED, execution status UNKNOWN** — minimal PR/push workflow `.github/workflows/tests.yml` was added on `feat/local-model-adapter`; its run has not yet been observed.
+- GitHub Actions workflow: **PASS — run 40880419835, conclusion `success`** for workflow commit `055b94657daaddc2af85fececd0031e6f7e483c2`. The `test` job completed checkout, Python setup, pytest, and compileall successfully. This confirms the workflow runs; it is not evidence that every later commit has its own run.
 - Termux-first benchmark: **UNKNOWN — adapter smoke only; representative coding task, interruption recovery, background survival, resource and thermal measures not yet benchmarked**.
 - Hybrid benchmark: **UNKNOWN — workflow exists but no Actions run or same-task comparative benchmark has been observed**.
 - Separate-host benchmark: **UNKNOWN — availability not established**.
