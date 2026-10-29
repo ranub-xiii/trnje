@@ -28,6 +28,7 @@ def test_success_is_bounded_and_uses_no_shell(tmp_path):
     assert result.status == "PASS"
     assert result.output == "TRNJE_LOCAL_MODEL_OK"
     assert run.call_args.kwargs["shell"] is False
+    assert "--simple-io" in run.call_args.args[0]
     assert run.call_args.kwargs["timeout"] == 120
 
 
