@@ -91,7 +91,10 @@ def run_local_model(
         )
 
     elapsed = time.monotonic() - started
-    output = completed.stdout.strip()
+    # llama.cpp builds differ: some emit the interactive/model text on stderr.
+    # Prefer stdout when present, otherwise preserve stderr for result detection
+    # and diagnostics rather than treating a successful process as empty.
+    output = completed.stdout.strip() or completed.stderr.strip()
     if completed.returncode != 0:
         return ModelResult(
             status="FAIL",
