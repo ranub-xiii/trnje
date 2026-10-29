@@ -51,3 +51,17 @@ def test_timeout_is_blocked(tmp_path):
     ):
         result = run_local_model("hello", model_path=model)
     assert result.status == "BLOCKED"
+
+
+def test_success_accepts_model_text_on_stderr(tmp_path):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"fixture")
+    completed = CompletedProcess(
+        args=[], returncode=0, stdout="", stderr="model banner\\nTRNJE_LOCAL_MODEL_OK\\n"
+    )
+    with patch("trnje.local_model.shutil.which", return_value="/usr/bin/llama-cli"), patch(
+        "trnje.local_model.subprocess.run", return_value=completed
+    ):
+        result = run_local_model("say OK", model_path=model)
+    assert result.status == "PASS"
+    assert "TRNJE_LOCAL_MODEL_OK" in result.output
