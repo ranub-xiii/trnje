@@ -66,6 +66,7 @@ def run_local_model(
         "--temp", "0",
         "--single-turn",
         "--no-display-prompt",
+        "--simple-io",
     ]
     started = time.monotonic()
     try:
