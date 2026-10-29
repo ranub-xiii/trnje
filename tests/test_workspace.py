@@ -1,0 +1,55 @@
+from pathlib import Path
+from unittest.mock import patch
+from subprocess import CompletedProcess
+
+from trnje.workspace import inspect_file, replace_exact, run_checks
+
+
+def test_inspect_file_is_bounded_and_reads_utf8(tmp_path):
+    (tmp_path / "a.txt").write_text("héllo", encoding="utf-8")
+    assert inspect_file(tmp_path, "a.txt").output == "héllo"
+    assert inspect_file(tmp_path, "a.txt", max_bytes=2).status == "BLOCKED"
+
+
+def test_replace_exact_only_changes_one_unique_match(tmp_path):
+    target = tmp_path / "a.txt"
+    target.write_text("alpha beta", encoding="utf-8")
+    result = replace_exact(tmp_path, "a.txt", "beta", "gamma")
+    assert result.status == "PASS"
+    assert target.read_text(encoding="utf-8") == "alpha gamma"
+
+
+def test_replace_exact_refuses_missing_or_duplicate_match(tmp_path):
+    target = tmp_path / "a.txt"
+    target.write_text("same same", encoding="utf-8")
+    assert replace_exact(tmp_path, "a.txt", "absent", "new").status == "BLOCKED"
+    assert replace_exact(tmp_path, "a.txt", "same", "new").status == "BLOCKED"
+    assert target.read_text(encoding="utf-8") == "same same"
+
+
+def test_workspace_escape_and_symlink_are_blocked(tmp_path):
+    outside = tmp_path.parent / "outside-trnje-test.txt"
+    outside.write_text("keep", encoding="utf-8")
+    try:
+        assert inspect_file(tmp_path, "../outside-trnje-test.txt").status == "BLOCKED"
+        link = tmp_path / "linked.txt"
+        link.symlink_to(outside)
+        assert replace_exact(tmp_path, "linked.txt", "keep", "changed").status == "BLOCKED"
+        assert outside.read_text(encoding="utf-8") == "keep"
+    finally:
+        outside.unlink(missing_ok=True)
+
+
+def test_checks_use_fixed_commands_without_shell(tmp_path):
+    with patch("trnje.workspace.subprocess.run", return_value=CompletedProcess([], 0, "ok", "")) as run:
+        result = run_checks(tmp_path)
+    assert result.status == "PASS"
+    assert run.call_count == 2
+    assert all(call.kwargs["shell"] is False for call in run.call_args_list)
+
+
+def test_check_failure_stops_following_commands(tmp_path):
+    with patch("trnje.workspace.subprocess.run", return_value=CompletedProcess([], 1, "", "failed")) as run:
+        result = run_checks(tmp_path)
+    assert result.status == "FAIL"
+    assert run.call_count == 1
