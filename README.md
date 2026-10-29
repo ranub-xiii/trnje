@@ -17,6 +17,20 @@ python scripts/model_smoke.py
 
 The command uses a bounded timeout and token count, emits a JSON result, and returns a nonzero exit code unless the expected marker appears in model output. To run unit tests, use `python -m pytest -q`.
 
+## Minimal task loop (experimental)
+
+The first task loop is intentionally narrow: it inspects one explicitly selected file, asks the local model for one exact text replacement, applies it only if the old text matches exactly once, and runs the fixed repository checks. It does not retry, run model-supplied shell commands, commit, push, or merge. If verification fails after an edit, the changed file is left in place and the JSON report says so; inspect the diff before continuing.
+
+```bash
+export TRNJE_MODEL_PATH="$HOME/models/qwen2.5-coder-0.5b-instruct-q4_0.gguf"
+python scripts/run_task.py \
+  --workspace "$HOME/trnje" \
+  --file "path/inside/project.py" \
+  --task "Describe one small, testable correction"
+```
+
+Use a real relative path and a narrow task. This is an experimental one-file loop, not proof of full autonomous coding capability. Its output is a JSON report; exit code 0 means the fixed checks passed, not that the task was independently judged correct.
+
 ## Prototype goal
 
 For one bounded coding task, the first prototype should inspect the project, make a scoped fix, run relevant checks, attempt a limited repair when justified, preserve progress across interruption, and report the observed result with evidence.
