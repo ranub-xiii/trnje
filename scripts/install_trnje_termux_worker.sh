@@ -31,7 +31,7 @@ issue_number="$(gh api repos/ranub-xiii/trnje/issues/3 --jq .number 2>/dev/null 
 [ "$issue_number" = "3" ] || fail "Dedicated Trnje mailbox Issue #3 is not accessible."
 
 url="https://raw.githubusercontent.com/ranub-xiii/trnje/feat/trnje-termux-worker/scripts/trnje_termux_worker.py"
-expected_sha256="b3407604f1f902f760ceb4883b25a938c79ec6b47b59dc54e9b06c156603364e"
+expected_sha256="bec960c1f8e3bf2ff2dee61eab198a75b94d4da0c37a4c0d47e0cb3ba5a55984"
 tmpdir="$(printenv TMPDIR 2>/dev/null || true)"
 [ -n "$tmpdir" ] || tmpdir="/tmp"
 tmp="$(mktemp "$tmpdir/trnje-worker.XXXXXX")"
