@@ -175,7 +175,7 @@ def main() -> int:
         if issue.returncode != 0 or issue.stdout.strip() != "3":
             print("BLOCKED: dedicated Trnje Issue #3 is not accessible; local report was preserved.")
             return 2
-        body = "TRNJE_MODEL_INVENTORY_JSON\\n" + json.dumps(result, ensure_ascii=False, sort_keys=True)
+        body = "TRNJE_MODEL_INVENTORY_JSON\n" + json.dumps(result, ensure_ascii=False, sort_keys=True)
         if len(body.encode("utf-8")) > 16_000:
             print("BLOCKED: inventory report exceeds the safe GitHub comment limit; local report was preserved.")
             return 2
