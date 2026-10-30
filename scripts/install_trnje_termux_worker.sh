@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Installs only the standalone worker; does not modify either repository.
-set -eu
+set -euo pipefail
 umask 077
 
 fail() {
@@ -8,7 +8,6 @@ fail() {
   exit 2
 }
 
-command -v curl >/dev/null 2>&1 || fail "curl is required."
 command -v python >/dev/null 2>&1 || fail "python is required."
 command -v gh >/dev/null 2>&1 || fail "GitHub CLI gh is required."
 command -v install >/dev/null 2>&1 || fail "install utility is required."
@@ -30,14 +29,16 @@ esac
 issue_number="$(gh api repos/ranub-xiii/trnje/issues/3 --jq .number 2>/dev/null || true)"
 [ "$issue_number" = "3" ] || fail "Dedicated Trnje mailbox Issue #3 is not accessible."
 
-url="https://raw.githubusercontent.com/ranub-xiii/trnje/feat/trnje-termux-worker/scripts/trnje_termux_worker.py"
-expected_sha256="bec960c1f8e3bf2ff2dee61eab198a75b94d4da0c37a4c0d47e0cb3ba5a55984"
 tmpdir="$(printenv TMPDIR 2>/dev/null || true)"
 [ -n "$tmpdir" ] || tmpdir="/tmp"
 tmp="$(mktemp "$tmpdir/trnje-worker.XXXXXX")"
 trap 'rm -f "$tmp"' EXIT HUP INT TERM
 
-curl -fsSL --connect-timeout 10 --max-time 60 "$url" -o "$tmp" || fail "Could not fetch the pinned Trnje worker."
+# The repository is private: fetch through the authenticated GitHub CLI API.
+gh api "repos/ranub-xiii/trnje/contents/scripts/trnje_termux_worker.py?ref=feat/trnje-termux-worker" --jq .content |
+  python -c 'import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))' > "$tmp"
+
+expected_sha256="bec960c1f8e3bf2ff2dee61eab198a75b94d4da0c37a4c0d47e0cb3ba5a55984"
 actual_sha256="$(python -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$tmp")"
 [ "$actual_sha256" = "$expected_sha256" ] || fail "Worker SHA-256 does not match the installer pin."
 
