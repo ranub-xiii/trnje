@@ -13,7 +13,6 @@ from pathlib import Path
 HOME = Path.home()
 STATE = HOME / ".local/state/trnje-worker"
 LOGS = STATE / "logs"
-PUBLISHER = HOME / "bin/trnje-publish"
 ROOTS = (
     HOME / "models",
     HOME / ".cache/llama.cpp",
@@ -159,25 +158,45 @@ def main() -> int:
         pass
     print(json.dumps({"status": result["status"], "report": str(report),
                       "model_count": result["model_count"]}, ensure_ascii=False))
-    if not PUBLISHER.is_file() or not os.access(PUBLISHER, os.X_OK):
-        print("BLOCKED: Trnje Dropbox publisher is unavailable.")
+    gh = shutil.which("gh")
+    if not gh:
+        print("BLOCKED: GitHub CLI gh is unavailable; local report was preserved.")
         return 2
     try:
-        published = subprocess.run([str(PUBLISHER), str(report)], stdin=subprocess.DEVNULL,
-                                   capture_output=True, text=True, timeout=120,
-                                   check=False, shell=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        print(f"BLOCKED: publisher failed ({type(exc).__name__}).")
+        login = subprocess.run([gh, "api", "user", "--jq", ".login"],
+                               stdin=subprocess.DEVNULL, capture_output=True,
+                               text=True, timeout=20, check=False, shell=False)
+        if login.returncode != 0 or login.stdout.strip() not in {"ranub-xiii", "xiiitore"}:
+            print("BLOCKED: GitHub authentication is missing or not allowlisted; local report was preserved.")
+            return 2
+        issue = subprocess.run([gh, "api", "repos/ranub-xiii/trnje/issues/3", "--jq", ".number"],
+                               stdin=subprocess.DEVNULL, capture_output=True,
+                               text=True, timeout=20, check=False, shell=False)
+        if issue.returncode != 0 or issue.stdout.strip() != "3":
+            print("BLOCKED: dedicated Trnje Issue #3 is not accessible; local report was preserved.")
+            return 2
+        body = "TRNJE_MODEL_INVENTORY_JSON\\n" + json.dumps(result, ensure_ascii=False, sort_keys=True)
+        if len(body.encode("utf-8")) > 16_000:
+            print("BLOCKED: inventory report exceeds the safe GitHub comment limit; local report was preserved.")
+            return 2
+        posted = subprocess.run(
+            [gh, "api", "repos/ranub-xiii/trnje/issues/3/comments", "--method", "POST", "-f", f"body={body}"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=30, check=False, shell=False)
+        if posted.returncode != 0:
+            print("BLOCKED: GitHub result publication failed; local report was preserved.")
+            return 2
+        confirmation = json.loads(posted.stdout)
+        if not isinstance(confirmation.get("id"), int):
+            print("BLOCKED: GitHub did not confirm the result comment; local report was preserved.")
+            return 2
+        print(json.dumps({"status": "PASS", "issue_comment_id": confirmation["id"],
+                          "issue_url": confirmation.get("html_url"), "local_report": str(report)},
+                         ensure_ascii=False))
+        return 0
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+        print(f"BLOCKED: publication failed ({type(exc).__name__}); local report was preserved.")
         return 2
-    output = (published.stdout or "") + (published.stderr or "")
-    print(output[:4000])
-    if published.returncode != 0:
-        return 2
-    try:
-        confirmation = json.loads(published.stdout)
-    except json.JSONDecodeError:
-        return 2
-    return 0 if confirmation.get("status") == "PASS" else 2
 
 
 if __name__ == "__main__":
