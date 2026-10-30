@@ -26,8 +26,8 @@ MAX_DEPTH = 4
 MAX_DIRS = 500
 MAX_ENTRIES = 5000
 MAX_CANDIDATES = 20
-MAX_FILE_BYTES = 12 * 1024**3
-MAX_TOTAL_HASH_BYTES = 24 * 1024**3
+MAX_FILE_BYTES = 6 * 1024**3
+MAX_TOTAL_HASH_BYTES = 6 * 1024**3
 SKIP_DIRS = {".git", ".ssh", ".config", "node_modules", "__pycache__", "Android", "data"}
 
 
@@ -148,10 +148,11 @@ def inventory() -> dict:
 def main() -> int:
     result = inventory()
     LOGS.mkdir(mode=0o700, parents=True, exist_ok=True)
-    report = LOGS / f"model-inventory-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.md"
-    report.write_text("# Trnje local model inventory\n\n\n\n~~~json\n"
-                      + json.dumps(result, ensure_ascii=False, indent=2)
-                      + "\n~~~\n", encoding="utf-8")
+    report = LOGS / f"model-inventory-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{time.time_ns()}.md"
+    with report.open("x", encoding="utf-8") as stream:
+        stream.write("# Trnje local model inventory\n\n~~~json\n"
+                     + json.dumps(result, ensure_ascii=False, indent=2)
+                     + "\n~~~\n")
     try:
         report.chmod(0o600)
     except OSError:
