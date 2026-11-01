@@ -198,13 +198,13 @@ def main():
     report["installed_worker"]={"path":str(worker),**safe_file_hash(worker,[0])} if worker.is_file() else {"status":"ABSENT","path":str(worker)}
     report["duration_seconds"]=round(time.time()-start,3)
     payload=json.dumps(report,indent=2,sort_keys=True,ensure_ascii=False)
-    print(payload)
     outdir=HOME/'.local/state/trnje-worker/snapshots'
     outdir.mkdir(parents=True,exist_ok=True,mode=0o700)
     out=outdir/f"phase0-{time.strftime('%Y%m%dT%H%M%SZ',time.gmtime())}.json"
     fd=os.open(out,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
     with os.fdopen(fd,'w',encoding='utf-8') as f:
         f.write(payload+'\n')
+    print("SNAPSHOT=PASS; report="+str(out))
     if not PUBLISHER.is_file() or not os.access(PUBLISHER,os.X_OK):
         print(f"PUBLISH=BLOCKED; report={out}",file=sys.stderr)
         return 2
