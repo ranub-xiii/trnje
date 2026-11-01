@@ -24,7 +24,7 @@ def run_local_model(
     *,
     model_path: str | os.PathLike[str] | None = None,
     executable: str | None = None,
-    timeout_seconds: int = 120,
+    timeout_seconds: int = 10800,
     max_tokens: int = 128,
     context_size: int = 1024,
     threads: int = 4,
@@ -117,3 +117,4 @@ def run_local_model(
         returncode=completed.returncode,
         elapsed_seconds=elapsed,
     )
+
