@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from trnje.local_model import run_local_model
-from trnje.workspace import inspect_file, replace_exact, run_checks
+from trnje.workspace import inspect_file, _replace_exact_unlocked as replace_exact, _restore_if_unchanged_unlocked as restore_if_unchanged, run_checks, workspace_lock
 
 
 @dataclass(frozen=True)
@@ -31,35 +31,54 @@ class TaskReport:
         }
 
 
-def _extract_edit(output: str) -> dict[str, str] | None:
-    """Accept a JSON object only; tolerate a short model preamble, not code fences."""
-    start, end = output.find("{"), output.rfind("}")
-    if start < 0 or end <= start:
-        return None
-    try:
-        value = json.loads(output[start : end + 1])
-    except (json.JSONDecodeError, TypeError):
-        return None
-    if not isinstance(value, dict) or set(value) != {"old", "new", "summary"}:
-        return None
-    if not all(isinstance(value[key], str) for key in ("old", "new", "summary")):
-        return None
-    if not value["old"] or not value["summary"].strip():
-        return None
-    return value
+def _extract_edit(output: str, source_text: str | None = None) -> dict[str, str] | None:
+    """Extract the first valid, uniquely applicable JSON edit."""
+    decoder = json.JSONDecoder()
+
+    for index, char in enumerate(output):
+        if char != "{":
+            continue
+
+        try:
+            value, _ = decoder.raw_decode(output[index:])
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        if not isinstance(value, dict):
+            continue
+        if set(value) != {"old", "new", "summary"}:
+            continue
+        if not all(
+            isinstance(value[key], str)
+            for key in ("old", "new", "summary")
+        ):
+            continue
+
+        old = value["old"]
+        if not old or not value["summary"].strip():
+            continue
+        if source_text is not None and source_text.count(old) != 1:
+            continue
+
+        return value
+
+    return None
 
 
-def run_task(
+def _run_task_locked(
     workspace: str | Path,
     relative_file: str,
     task_description: str,
     *,
-    model_timeout_seconds: int = 120,
+    expected_text: str,
+    model_timeout_seconds: int = 10800,
     check_timeout_seconds: int = 120,
 ) -> TaskReport:
     """Inspect one user-selected file, request one exact edit, and verify once."""
     if not task_description.strip():
         return TaskReport("FAIL", "input", "Task description must not be empty.", relative_file)
+    if not expected_text.strip():
+        return TaskReport("FAIL", "input", "Expected text must not be empty.", relative_file)
     inspected = inspect_file(workspace, relative_file, max_bytes=12000)
     if inspected.status != "PASS":
         return TaskReport(inspected.status, "inspect", inspected.detail, relative_file)
@@ -67,29 +86,143 @@ def run_task(
     prompt = (
         "You are proposing one minimal source-code edit. Return exactly one JSON object "
         'with string keys "old", "new", and "summary". "old" must be a non-empty exact '
-        "substring of the supplied file, occurring once. Do not include a file path, "
-        "commands, markdown fences, or any other keys. Do not claim tests were run. "
-        "Make only the smallest change that addresses the task.\n\n"
+        "substring of the supplied file, occurring once. If the task requests replacing "
+        "an entire line, the old value MUST be the complete original line and the new "
+        "value MUST be the complete replacement line, including its prefix. Never change "
+        "only a value token when the task requires changing the whole line. Do not include "
+        "a file path, commands, markdown fences, or any other keys. Do not claim tests were "
+        "run. Make only the smallest change that fully satisfies the task.\n\n"
         f"TASK:\n{task_description[:2000]}\n\n"
+        f"ACCEPTANCE CONDITION: the final file must contain this exact text:\n{expected_text[:2000]}\n\n"
         f"FILE: {relative_file}\nFILE CONTENT:\n{inspected.output}"
     )
     proposed = run_local_model(prompt, timeout_seconds=model_timeout_seconds, max_tokens=512, context_size=4096)
-    if proposed.status != "PASS":
-        return TaskReport(proposed.status, "model", proposed.error, relative_file)
-    edit = _extract_edit(proposed.output)
+    if proposed.status != "PASS" or proposed.output.find("Model output preview:") != -1:
+        return TaskReport(proposed.status if proposed.status != "PASS" else "BLOCKED", "model", proposed.error or "Model output was rejected by the proposal guard.", relative_file)
+    edit = _extract_edit(proposed.output, inspected.output)
     if edit is None:
         return TaskReport("BLOCKED", "proposal", "Model did not return the required edit JSON.", relative_file)
     applied = replace_exact(workspace, relative_file, edit["old"], edit["new"], max_file_bytes=20000)
     if applied.status != "PASS":
         return TaskReport(applied.status, "edit", applied.detail, relative_file, edit["summary"])
 
+    verified = inspect_file(workspace, relative_file, max_bytes=20000)
+    if verified.status != "PASS":
+        return TaskReport(verified.status, "edit_verify", verified.detail, relative_file, edit["summary"])
+    if verified.output == inspected.output:
+        return TaskReport(
+            "FAIL",
+            "edit_verify",
+            "Replacement reported success, but file content did not change.",
+            relative_file,
+            summary=edit["summary"],
+            changed=False,
+        )
+
+    if expected_text not in verified.output:
+        rollback = restore_if_unchanged(
+            workspace,
+            relative_file,
+            expected_current=verified.output,
+            original_content=inspected.output,
+            max_file_bytes=20000,
+        )
+        if rollback.status != "PASS":
+            return TaskReport(
+                "FAIL",
+                "rollback",
+                "Acceptance failed; rollback could not be confirmed: " + rollback.detail,
+                relative_file,
+                summary=edit["summary"],
+                changed=True,
+            )
+        restored = inspect_file(workspace, relative_file, max_bytes=20000)
+        if restored.status != "PASS" or restored.output != inspected.output:
+            detail = restored.detail if restored.status != "PASS" else "Restored content differs from the original."
+            return TaskReport(
+                "FAIL",
+                "rollback",
+                "Acceptance failed; rollback verification failed: " + detail,
+                relative_file,
+                summary=edit["summary"],
+                changed=True,
+            )
+        return TaskReport(
+            "FAIL",
+            "acceptance",
+            "Edited file did not satisfy acceptance; original content was restored and verified.",
+            relative_file,
+            summary=edit["summary"],
+            changed=False,
+        )
+
     checks = run_checks(workspace, timeout_seconds=check_timeout_seconds)
+    if checks.status != "PASS":
+        rollback = restore_if_unchanged(
+            workspace, relative_file,
+            expected_current=verified.output,
+            original_content=inspected.output,
+            max_file_bytes=20000,
+        )
+        if rollback.status != "PASS":
+            return TaskReport(
+                "FAIL", "rollback",
+                "Checks failed; rollback could not be confirmed: " + rollback.detail,
+                relative_file, summary=edit["summary"],
+                checks=checks.output, changed=True,
+            )
+        restored = inspect_file(workspace, relative_file, max_bytes=20000)
+        if restored.status != "PASS" or restored.output != inspected.output:
+            detail = restored.detail if restored.status != "PASS" else "Restored content differs from the original."
+            return TaskReport(
+                "FAIL", "rollback",
+                "Checks failed; rollback verification failed: " + detail,
+                relative_file, summary=edit["summary"],
+                checks=checks.output, changed=True,
+            )
+        return TaskReport(
+            "FAIL", "checks",
+            "Checks failed; original content was restored and verified.",
+            relative_file, summary=edit["summary"],
+            checks=checks.output, changed=False,
+        )
     return TaskReport(
-        checks.status,
-        "verify" if checks.status == "PASS" else "checks",
-        checks.detail,
-        relative_file,
-        summary=edit["summary"],
-        checks=checks.output,
-        changed=True,
+        checks.status, "verify", checks.detail, relative_file,
+        summary=edit["summary"], checks=checks.output, changed=True,
     )
+
+
+
+def run_task(
+    workspace: str | Path,
+    relative_file: str,
+    task_description: str,
+    *,
+    expected_text: str,
+    model_timeout_seconds: int = 10800,
+    check_timeout_seconds: int = 120,
+) -> TaskReport:
+    """Run a task while holding the workspace-wide cooperative lock."""
+    lock = workspace_lock(workspace)
+    try:
+        lock.__enter__()
+    except (OSError, ValueError) as exc:
+        return TaskReport(
+            "BLOCKED",
+            "lock",
+            f"Could not acquire workspace lock ({type(exc).__name__}).",
+            relative_file,
+        )
+
+    try:
+        return _run_task_locked(
+            workspace,
+            relative_file,
+            task_description,
+            expected_text=expected_text,
+            model_timeout_seconds=model_timeout_seconds,
+            check_timeout_seconds=check_timeout_seconds,
+        )
+    finally:
+        lock.__exit__(None, None, None)
+
