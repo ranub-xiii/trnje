@@ -7,6 +7,11 @@ from __future__ import annotations
 
 import os
 import subprocess
+import fcntl
+import hashlib
+import tempfile
+from contextlib import contextmanager
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +22,24 @@ class OperationResult:
     detail: str = ""
     output: str = ""
     returncode: int | None = None
+
+
+@contextmanager
+def workspace_lock(workspace: str | os.PathLike[str]) -> Iterator[None]:
+    """Serialize cooperating task runners for the same resolved workspace."""
+    root = Path(workspace).resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError("Workspace must be a directory.")
+    lock_dir = Path(tempfile.gettempdir()) / "trnje-locks"
+    lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    digest = hashlib.sha256(os.fsencode(str(root))).hexdigest()
+    lock_path = lock_dir / f"{digest}.lock"
+    with lock_path.open("a+b") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _workspace_file(workspace: str | os.PathLike[str], relative_path: str) -> tuple[Path, Path]:
@@ -52,7 +75,7 @@ def inspect_file(workspace: str | os.PathLike[str], relative_path: str, *, max_b
         return OperationResult("BLOCKED", f"Inspection refused ({type(exc).__name__}).")
 
 
-def replace_exact(
+def _replace_exact_unlocked(
     workspace: str | os.PathLike[str],
     relative_path: str,
     old: str,
@@ -63,6 +86,8 @@ def replace_exact(
     """Apply one exact replacement only when the old text occurs exactly once."""
     if not old:
         return OperationResult("FAIL", "The old text must not be empty.")
+    if old == new:
+        return OperationResult("FAIL", "Replacement would not change file content.")
     try:
         root, target = _workspace_file(workspace, relative_path)
         if not target.is_file():
@@ -97,6 +122,66 @@ def replace_exact(
     except (OSError, UnicodeError, ValueError) as exc:
         return OperationResult("BLOCKED", f"Edit refused ({type(exc).__name__}).")
 
+
+
+def _restore_if_unchanged_unlocked(
+    workspace: str | os.PathLike[str],
+    relative_path: str,
+    expected_current: str,
+    original_content: str,
+    *,
+    max_file_bytes: int = 20000,
+) -> OperationResult:
+    """Restore original content only if the file still matches the inspected edit."""
+    try:
+        root, target = _workspace_file(workspace, relative_path)
+        if not target.is_file():
+            return OperationResult("BLOCKED", "Rollback target is not a regular file.")
+        if target.stat().st_size > max_file_bytes:
+            return OperationResult("BLOCKED", "Rollback target exceeds the size limit.")
+        current = target.read_text(encoding="utf-8")
+        if current != expected_current:
+            return OperationResult(
+                "BLOCKED",
+                "Rollback refused because the file changed after verification.",
+            )
+        if len(original_content.encode("utf-8")) > max_file_bytes:
+            return OperationResult("BLOCKED", "Original content exceeds the size limit.")
+        if target.is_symlink() or not target.resolve(strict=False).is_relative_to(root):
+            return OperationResult("BLOCKED", "Rollback target escaped the workspace.")
+        temp = target.with_name(f".{target.name}.trnje-tmp")
+        if temp.exists() or temp.is_symlink():
+            return OperationResult("BLOCKED", "Rollback temporary path already exists.")
+        try:
+            with temp.open("x", encoding="utf-8", newline="") as handle:
+                handle.write(original_content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, target)
+        finally:
+            if temp.exists():
+                temp.unlink()
+        return OperationResult("PASS", "Original content restored.")
+    except (OSError, UnicodeError, ValueError) as exc:
+        return OperationResult("BLOCKED", f"Rollback refused ({type(exc).__name__}).")
+
+
+def replace_exact(workspace: str | os.PathLike[str], relative_path: str, old: str, new: str, *, max_file_bytes: int=20000) -> OperationResult:
+    """Run the operation while holding the workspace lock."""
+    try:
+        with workspace_lock(workspace):
+            return _replace_exact_unlocked(workspace=workspace, relative_path=relative_path, old=old, new=new, max_file_bytes=max_file_bytes)
+    except (OSError, ValueError) as exc:
+        return OperationResult("BLOCKED", f"Edit refused ({type(exc).__name__}).")
+
+
+def restore_if_unchanged(workspace: str | os.PathLike[str], relative_path: str, expected_current: str, original_content: str, *, max_file_bytes: int=20000) -> OperationResult:
+    """Run the operation while holding the workspace lock."""
+    try:
+        with workspace_lock(workspace):
+            return _restore_if_unchanged_unlocked(workspace=workspace, relative_path=relative_path, expected_current=expected_current, original_content=original_content, max_file_bytes=max_file_bytes)
+    except (OSError, ValueError) as exc:
+        return OperationResult("BLOCKED", f"Rollback refused ({type(exc).__name__}).")
 
 def run_checks(
     workspace: str | os.PathLike[str],
@@ -144,3 +229,4 @@ def run_checks(
         return OperationResult("PASS", "Both fixed checks passed.", output="\n\n".join(outputs), returncode=0)
     except OSError as exc:
         return OperationResult("BLOCKED", f"Could not run checks ({type(exc).__name__}).")
+
