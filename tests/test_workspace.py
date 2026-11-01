@@ -19,6 +19,16 @@ def test_replace_exact_only_changes_one_unique_match(tmp_path):
     assert target.read_text(encoding="utf-8") == "alpha gamma"
 
 
+def test_replace_exact_refuses_noop_replacement(tmp_path):
+    target = tmp_path / "a.txt"
+    target.write_text("unchanged", encoding="utf-8")
+
+    result = replace_exact(tmp_path, "a.txt", "unchanged", "unchanged")
+
+    assert result.status == "FAIL"
+    assert target.read_text(encoding="utf-8") == "unchanged"
+
+
 def test_replace_exact_refuses_missing_or_duplicate_match(tmp_path):
     target = tmp_path / "a.txt"
     target.write_text("same same", encoding="utf-8")
@@ -53,3 +63,32 @@ def test_check_failure_stops_following_commands(tmp_path):
         result = run_checks(tmp_path)
     assert result.status == "FAIL"
     assert run.call_count == 1
+
+
+def test_restore_if_unchanged_restores_original_content(tmp_path):
+    from trnje.workspace import restore_if_unchanged
+
+    target = tmp_path / "a.txt"
+    target.write_text("bad edit\n", encoding="utf-8")
+
+    result = restore_if_unchanged(
+        tmp_path, "a.txt", expected_current="bad edit\n", original_content="original\n"
+    )
+
+    assert result.status == "PASS"
+    assert target.read_text(encoding="utf-8") == "original\n"
+
+
+def test_restore_if_unchanged_refuses_concurrent_change(tmp_path):
+    from trnje.workspace import restore_if_unchanged
+
+    target = tmp_path / "a.txt"
+    target.write_text("concurrent edit\n", encoding="utf-8")
+
+    result = restore_if_unchanged(
+        tmp_path, "a.txt", expected_current="bad edit\n", original_content="original\n"
+    )
+
+    assert result.status == "BLOCKED"
+    assert target.read_text(encoding="utf-8") == "concurrent edit\n"
+
