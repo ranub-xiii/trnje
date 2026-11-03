@@ -72,6 +72,14 @@ class TrnjeTermuxWorkerTests(unittest.TestCase):
             self.assertEqual(result["status"], "BLOCKED")
             self.assertIn("FILE_NOT_FOUND", result["detail"])
 
+    def test_empty_mailbox_poll_updates_heartbeat(self):
+        state = {"version": 1, "last_seen": 0, "tasks": {}}
+        with patch.object(WORKER, "comments", return_value=[]), \
+             patch.object(WORKER, "deliver"), patch.object(WORKER, "save"):
+            self.assertEqual(WORKER.once(Path("/tmp"), state), 0)
+        self.assertEqual(state["last_poll_status"], "PASS")
+        self.assertIsInstance(state["last_poll_at"], int)
+
     def test_subprocess_disables_shell_and_stdin(self):
         with patch.object(WORKER.subprocess, "run") as mocked:
             mocked.return_value = type(
