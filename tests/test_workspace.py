@@ -113,6 +113,7 @@ def test_workspace_lock_serializes_competing_threads(tmp_path):
 
     holder_entered = threading.Event()
     release_holder = threading.Event()
+    contender_started = threading.Event()
     contender_entered = threading.Event()
 
     def holder():
@@ -121,6 +122,7 @@ def test_workspace_lock_serializes_competing_threads(tmp_path):
             assert release_holder.wait(2)
 
     def contender():
+        contender_started.set()
         with workspace_lock(tmp_path):
             contender_entered.set()
 
@@ -130,6 +132,7 @@ def test_workspace_lock_serializes_competing_threads(tmp_path):
 
     second = threading.Thread(target=contender)
     second.start()
+    assert contender_started.wait(1)
     assert not contender_entered.wait(0.05)
 
     release_holder.set()
