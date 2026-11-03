@@ -108,7 +108,52 @@ def _run_task_locked(
 
     verified = inspect_file(workspace, relative_file, max_bytes=20000)
     if verified.status != "PASS":
-        return TaskReport(verified.status, "edit_verify", verified.detail, relative_file, edit["summary"])
+        # We know the exact content our atomic replacement should have produced.
+        # Roll back only if the current file still equals that content; this
+        # refuses to overwrite any concurrent, non-cooperating writer.
+        expected_edited = inspected.output.replace(edit["old"], edit["new"], 1)
+        rollback_limit = max(
+            20000,
+            len(expected_edited.encode("utf-8")),
+            len(inspected.output.encode("utf-8")),
+        )
+        rollback = restore_if_unchanged(
+            workspace,
+            relative_file,
+            expected_current=expected_edited,
+            original_content=inspected.output,
+            max_file_bytes=rollback_limit,
+        )
+        if rollback.status != "PASS":
+            return TaskReport(
+                "FAIL",
+                "rollback",
+                "Post-edit inspection was blocked; guarded rollback could not be confirmed: "
+                + rollback.detail,
+                relative_file,
+                summary=edit["summary"],
+                changed=True,
+            )
+        restored = inspect_file(workspace, relative_file, max_bytes=rollback_limit)
+        if restored.status != "PASS" or restored.output != inspected.output:
+            detail = restored.detail if restored.status != "PASS" else "Restored content differs from the original."
+            return TaskReport(
+                "FAIL",
+                "rollback",
+                "Post-edit inspection was blocked; rollback verification failed: " + detail,
+                relative_file,
+                summary=edit["summary"],
+                changed=True,
+            )
+        return TaskReport(
+            "BLOCKED",
+            "edit_verify",
+            "Post-edit inspection was blocked; original content was restored and verified: "
+            + verified.detail,
+            relative_file,
+            summary=edit["summary"],
+            changed=False,
+        )
     if verified.output == inspected.output:
         return TaskReport(
             "FAIL",
