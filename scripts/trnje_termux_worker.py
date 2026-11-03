@@ -450,6 +450,10 @@ def once(r: Path, s: dict) -> int:
         s["last_seen"] = c["id"]
         save(s)
         n += 1
+    s["last_poll_at"] = int(time.time())
+    s["last_poll_status"] = "PASS"
+    s.pop("last_poll_error", None)
+    save(s)
     return n
 
 
@@ -480,6 +484,10 @@ def main() -> int:
                 if n:
                     print(f"Scanned {n} new mailbox comments.", flush=True)
             except Blocked as exc:
+                s["last_poll_at"] = int(time.time())
+                s["last_poll_status"] = "BLOCKED"
+                s["last_poll_error"] = clean(str(exc))[:300]
+                save(s)
                 print(f"BLOCKED: {exc}", file=sys.stderr, flush=True)
             if a.once:
                 return 0
