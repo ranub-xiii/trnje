@@ -23,6 +23,7 @@ LOGS = STATE / "logs"
 STATE_FILE, LOCK_FILE = STATE / "state.json", STATE / "worker.lock"
 PUBLISHER = HOME / "bin/trnje-publish"
 MAX_TEXT, MAX_COMMENT = 24_000, 16_384
+MAX_READ_BYTES = 12_000
 
 REDACT = [
     re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"),
@@ -175,17 +176,27 @@ def parse(body: str) -> tuple[str, dict]:
     kind, p = obj["kind"], obj["payload"]
     schemas = {"diagnostics": set(), "git_status": set(), "run_tests": set(),
                "read_file": {"path"}, "run_task": {"file", "task", "expect"}}
-    if not isinstance(kind, str) or kind not in schemas or set(p) != schemas[kind]:
+    if not isinstance(kind, str) or kind not in schemas:
         raise Blocked("Task kind or payload fields are not allowlisted.")
-    if kind == "read_file" and not isinstance(p["path"], str):
-        raise Blocked("read_file.path must be a string.")
+    if kind == "read_file":
+        if "path" not in p or set(p) - {"path", "offset", "limit"}:
+            raise Blocked("read_file accepts only path, offset, and limit.")
+        if not isinstance(p["path"], str) or not p["path"].strip():
+            raise Blocked("read_file.path must be a non-empty string.")
+        offset, limit = p.get("offset", 0), p.get("limit", MAX_READ_BYTES)
+        if type(offset) is not int or offset < 0:
+            raise Blocked("read_file.offset must be a non-negative integer.")
+        if type(limit) is not int or not 4 <= limit <= MAX_READ_BYTES:
+            raise Blocked(f"read_file.limit must be between 4 and {MAX_READ_BYTES} bytes.")
+    elif set(p) != schemas[kind]:
+        raise Blocked("Task kind or payload fields are not allowlisted.")
     if kind == "run_task" and (not all(isinstance(p[k], str) and p[k].strip() for k in ("file", "task", "expect"))
                                or len(p["task"]) > 2000 or len(p["expect"]) > 2000):
         raise Blocked("run_task requires bounded file, task, and expect strings.")
     return kind, p
 
 
-def file_in_root(r: Path, name: str) -> Path:
+def file_in_root(r: Path, name: str, max_bytes: int | None = None) -> Path:
     p = Path(name)
     if p.is_absolute() or not name or any(x in ("", ".", "..") for x in p.parts):
         raise Blocked("Path must be a clean relative path.")
@@ -197,9 +208,62 @@ def file_in_root(r: Path, name: str) -> Path:
         current = current / part
         if current.is_symlink():
             raise Blocked("Symlink paths are not accessible.")
-    if not target.is_file() or target.stat().st_size > 20_000:
-        raise Blocked("File missing or larger than 20,000 bytes.")
+    if not target.exists():
+        raise Blocked("FILE_NOT_FOUND: requested file does not exist.")
+    if not target.is_file():
+        raise Blocked("NOT_A_FILE: requested path is not a regular file.")
+    if max_bytes is not None:
+        try:
+            size = target.stat().st_size
+        except OSError as exc:
+            raise Blocked(f"FILE_STAT_ERROR: {type(exc).__name__}.")
+        if size > max_bytes:
+            raise Blocked(f"FILE_TOO_LARGE: file exceeds {max_bytes} bytes.")
     return target
+
+
+def read_file_chunk(r: Path, name: str, offset: int = 0, limit: int = MAX_READ_BYTES) -> dict:
+    target = file_in_root(r, name)
+    try:
+        size = target.stat().st_size
+        if offset > size:
+            raise Blocked(f"OFFSET_OUT_OF_RANGE: {offset} exceeds file size {size}.")
+        start = offset
+        with target.open("rb") as stream:
+            if start:
+                stream.seek(start)
+                for _ in range(3):
+                    byte = stream.read(1)
+                    if not byte or byte[0] & 0xC0 != 0x80:
+                        break
+                    start += 1
+                    stream.seek(start)
+            stream.seek(start)
+            raw = stream.read(limit + 4)
+    except Blocked:
+        raise
+    except OSError as exc:
+        raise Blocked(f"FILE_READ_ERROR: {type(exc).__name__}.")
+    chunk = raw[:limit]
+    while True:
+        try:
+            content = chunk.decode("utf-8")
+            break
+        except UnicodeDecodeError as exc:
+            if exc.reason == "unexpected end of data" and exc.end == len(chunk):
+                chunk = chunk[:exc.start]
+                continue
+            raise Blocked(f"FILE_NOT_UTF8: invalid UTF-8 near byte {start + exc.start}.")
+    end = start + len(chunk)
+    has_more = end < size
+    next_offset = end if has_more else None
+    output = (f"FILE: {name}\nSIZE_BYTES: {size}\nSTART_OFFSET: {start}\nEND_OFFSET: {end}\n"
+              f"NEXT_OFFSET: {next_offset if next_offset is not None else 'none'}\n"
+              f"COMPLETE: {str(not has_more).lower()}\n\n{content}")
+    return {"status": "PASS",
+            "detail": f"Read {len(chunk)} bytes at offset {start} of {size}; "
+                      + (f"continue at offset {next_offset}." if has_more else "file complete."),
+            "exit": 0, "output": clean(output)}
 
 
 def git_status(r: Path) -> dict:
@@ -234,8 +298,7 @@ def execute(r: Path, kind: str, p: dict) -> dict:
                 "output": json.dumps(data, indent=2)}
     if kind == "read_file":
         try:
-            return {"status": "PASS", "detail": "Bounded file read.",
-                    "exit": 0, "output": clean(file_in_root(r, p["path"]).read_text(encoding="utf-8"))}
+            return read_file_chunk(r, p["path"], p.get("offset", 0), p.get("limit", MAX_READ_BYTES))
         except (Blocked, OSError, UnicodeError) as exc:
             return {"status": "BLOCKED", "detail": str(exc), "exit": None, "output": ""}
     if kind == "run_tests":
@@ -249,7 +312,7 @@ def execute(r: Path, kind: str, p: dict) -> dict:
         return {"status": "PASS", "detail": "pytest and compileall passed.", "exit": 0, "output": "\n\n".join(outputs)}
     if kind == "run_task":
         try:
-            file_in_root(r, p["file"])
+            file_in_root(r, p["file"], max_bytes=20_000)
         except Blocked as exc:
             return {"status": "BLOCKED", "detail": str(exc), "exit": None, "output": ""}
         runner = r / "scripts/run_task.py"
