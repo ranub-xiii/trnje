@@ -43,6 +43,7 @@ def test_task_rejects_reported_edit_without_content_change(tmp_path):
 def test_task_applies_one_edit_and_reports_check_failure(tmp_path):
     target = tmp_path / "sample.py"
     target.write_text("x = 1\\n", encoding="utf-8")
+    target.chmod(0o600)
     model_json = '{"old":"x = 1","new":"x = 2","summary":"correct value"}'
     with patch("trnje.task.run_local_model", return_value=ModelResult("PASS", output=model_json)), patch(
         "trnje.task.run_checks", return_value=OperationResult("FAIL", "pytest failed", output="exit=1")
@@ -54,6 +55,7 @@ def test_task_applies_one_edit_and_reports_check_failure(tmp_path):
     assert result.checks == "exit=1"
     assert result.changed is False
     assert target.read_text(encoding="utf-8") == "x = 1\\n"
+    assert target.stat().st_mode & 0o777 == 0o600
 
 
 def test_task_rejects_edit_that_misses_acceptance_text(tmp_path):
