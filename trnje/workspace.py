@@ -6,6 +6,7 @@ must stay inside the configured workspace. This module does not commit changes.
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 import fcntl
 import hashlib
@@ -22,6 +23,7 @@ class OperationResult:
     detail: str = ""
     output: str = ""
     returncode: int | None = None
+    mode: int | None = None
 
 
 @contextmanager
@@ -68,9 +70,14 @@ def inspect_file(workspace: str | os.PathLike[str], relative_path: str, *, max_b
         _, target = _workspace_file(workspace, relative_path)
         if not target.is_file():
             return OperationResult("BLOCKED", "Target is not an existing regular file.")
-        if target.stat().st_size > max_bytes:
+        target_stat = target.stat()
+        if target_stat.st_size > max_bytes:
             return OperationResult("BLOCKED", f"File exceeds the {max_bytes}-byte read limit.")
-        return OperationResult("PASS", output=target.read_text(encoding="utf-8"))
+        return OperationResult(
+            "PASS",
+            output=target.read_text(encoding="utf-8"),
+            mode=target_stat.st_mode & 0o777,
+        )
     except (OSError, UnicodeError, ValueError) as exc:
         return OperationResult("BLOCKED", f"Inspection refused ({type(exc).__name__}).")
 
@@ -92,8 +99,10 @@ def _replace_exact_unlocked(
         root, target = _workspace_file(workspace, relative_path)
         if not target.is_file():
             return OperationResult("BLOCKED", "Target is not an existing regular file.")
-        if target.stat().st_size > max_file_bytes:
+        original_stat = target.stat()
+        if original_stat.st_size > max_file_bytes:
             return OperationResult("BLOCKED", f"File exceeds the {max_file_bytes}-byte edit limit.")
+        original_mode = original_stat.st_mode & 0o777
         original = target.read_text(encoding="utf-8")
         occurrences = original.count(old)
         if occurrences != 1:
@@ -110,9 +119,11 @@ def _replace_exact_unlocked(
         if temp.exists() or temp.is_symlink():
             return OperationResult("BLOCKED", "Temporary path already exists.")
         try:
-            with temp.open("x", encoding="utf-8", newline="") as handle:
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
                 handle.write(updated)
                 handle.flush()
+                os.fchmod(handle.fileno(), original_mode)
                 os.fsync(handle.fileno())
             os.replace(temp, target)
         finally:
@@ -130,6 +141,7 @@ def _restore_if_unchanged_unlocked(
     expected_current: str,
     original_content: str,
     *,
+    original_mode: int | None = None,
     max_file_bytes: int = 20000,
 ) -> OperationResult:
     """Restore original content only if the file still matches the inspected edit."""
@@ -137,8 +149,12 @@ def _restore_if_unchanged_unlocked(
         root, target = _workspace_file(workspace, relative_path)
         if not target.is_file():
             return OperationResult("BLOCKED", "Rollback target is not a regular file.")
-        if target.stat().st_size > max_file_bytes:
+        current_stat = target.stat()
+        if current_stat.st_size > max_file_bytes:
             return OperationResult("BLOCKED", "Rollback target exceeds the size limit.")
+        restore_mode = current_stat.st_mode & 0o777 if original_mode is None else original_mode
+        if not isinstance(restore_mode, int) or not 0 <= restore_mode <= 0o777:
+            return OperationResult("FAIL", "Original file mode must contain only permission bits.")
         current = target.read_text(encoding="utf-8")
         if current != expected_current:
             return OperationResult(
@@ -153,9 +169,11 @@ def _restore_if_unchanged_unlocked(
         if temp.exists() or temp.is_symlink():
             return OperationResult("BLOCKED", "Rollback temporary path already exists.")
         try:
-            with temp.open("x", encoding="utf-8", newline="") as handle:
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
                 handle.write(original_content)
                 handle.flush()
+                os.fchmod(handle.fileno(), restore_mode)
                 os.fsync(handle.fileno())
             os.replace(temp, target)
         finally:
@@ -175,11 +193,11 @@ def replace_exact(workspace: str | os.PathLike[str], relative_path: str, old: st
         return OperationResult("BLOCKED", f"Edit refused ({type(exc).__name__}).")
 
 
-def restore_if_unchanged(workspace: str | os.PathLike[str], relative_path: str, expected_current: str, original_content: str, *, max_file_bytes: int=20000) -> OperationResult:
+def restore_if_unchanged(workspace: str | os.PathLike[str], relative_path: str, expected_current: str, original_content: str, *, original_mode: int | None = None, max_file_bytes: int=20000) -> OperationResult:
     """Run the operation while holding the workspace lock."""
     try:
         with workspace_lock(workspace):
-            return _restore_if_unchanged_unlocked(workspace=workspace, relative_path=relative_path, expected_current=expected_current, original_content=original_content, max_file_bytes=max_file_bytes)
+            return _restore_if_unchanged_unlocked(workspace=workspace, relative_path=relative_path, expected_current=expected_current, original_content=original_content, original_mode=original_mode, max_file_bytes=max_file_bytes)
     except (OSError, ValueError) as exc:
         return OperationResult("BLOCKED", f"Rollback refused ({type(exc).__name__}).")
 
