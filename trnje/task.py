@@ -122,6 +122,7 @@ def _run_task_locked(
             relative_file,
             expected_current=expected_edited,
             original_content=inspected.output,
+            original_mode=inspected.mode,
             max_file_bytes=rollback_limit,
         )
         if rollback.status != "PASS":
@@ -170,6 +171,7 @@ def _run_task_locked(
             relative_file,
             expected_current=verified.output,
             original_content=inspected.output,
+            original_mode=inspected.mode,
             max_file_bytes=20000,
         )
         if rollback.status != "PASS":
@@ -207,6 +209,7 @@ def _run_task_locked(
             workspace, relative_file,
             expected_current=verified.output,
             original_content=inspected.output,
+            original_mode=inspected.mode,
             max_file_bytes=20000,
         )
         if rollback.status != "PASS":
