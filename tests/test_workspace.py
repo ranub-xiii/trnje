@@ -19,6 +19,29 @@ def test_replace_exact_only_changes_one_unique_match(tmp_path):
     assert target.read_text(encoding="utf-8") == "alpha gamma"
 
 
+def test_replace_exact_preserves_restrictive_and_executable_modes(tmp_path):
+    for mode in (0o600, 0o755):
+        target = tmp_path / f"mode-{mode:o}.txt"
+        target.write_text("before", encoding="utf-8")
+        target.chmod(mode)
+
+        result = replace_exact(tmp_path, target.name, "before", "after")
+
+        assert result.status == "PASS"
+        assert target.read_text(encoding="utf-8") == "after"
+        assert target.stat().st_mode & 0o777 == mode
+
+
+def test_replace_exact_refuses_noop_replacement(tmp_path):
+    target = tmp_path / "a.txt"
+    target.write_text("unchanged", encoding="utf-8")
+
+    result = replace_exact(tmp_path, "a.txt", "unchanged", "unchanged")
+
+    assert result.status == "FAIL"
+    assert target.read_text(encoding="utf-8") == "unchanged"
+
+
 def test_replace_exact_refuses_missing_or_duplicate_match(tmp_path):
     target = tmp_path / "a.txt"
     target.write_text("same same", encoding="utf-8")
@@ -53,3 +76,83 @@ def test_check_failure_stops_following_commands(tmp_path):
         result = run_checks(tmp_path)
     assert result.status == "FAIL"
     assert run.call_count == 1
+
+
+def test_restore_if_unchanged_restores_original_content(tmp_path):
+    from trnje.workspace import restore_if_unchanged
+
+    target = tmp_path / "a.txt"
+    target.write_text("bad edit\n", encoding="utf-8")
+
+    result = restore_if_unchanged(
+        tmp_path, "a.txt", expected_current="bad edit\n", original_content="original\n",
+        original_mode=0o600,
+    )
+
+    assert result.status == "PASS"
+    assert target.read_text(encoding="utf-8") == "original\n"
+    assert target.stat().st_mode & 0o777 == 0o600
+
+
+def test_restore_if_unchanged_refuses_concurrent_change(tmp_path):
+    from trnje.workspace import restore_if_unchanged
+
+    target = tmp_path / "a.txt"
+    target.write_text("concurrent edit\n", encoding="utf-8")
+
+    result = restore_if_unchanged(
+        tmp_path, "a.txt", expected_current="bad edit\n", original_content="original\n"
+    )
+
+    assert result.status == "BLOCKED"
+    assert target.read_text(encoding="utf-8") == "concurrent edit\n"
+
+
+
+def test_workspace_lock_is_released_after_exception(tmp_path):
+    import pytest
+    from trnje.workspace import workspace_lock
+
+    with pytest.raises(RuntimeError):
+        with workspace_lock(tmp_path):
+            raise RuntimeError("simulated task failure")
+
+    # A subsequent acquisition must not remain blocked by the failed task.
+    with workspace_lock(tmp_path):
+        pass
+
+
+def test_workspace_lock_serializes_competing_threads(tmp_path):
+    import threading
+    from trnje.workspace import workspace_lock
+
+    holder_entered = threading.Event()
+    release_holder = threading.Event()
+    contender_started = threading.Event()
+    contender_entered = threading.Event()
+
+    def holder():
+        with workspace_lock(tmp_path):
+            holder_entered.set()
+            assert release_holder.wait(2)
+
+    def contender():
+        contender_started.set()
+        with workspace_lock(tmp_path):
+            contender_entered.set()
+
+    first = threading.Thread(target=holder)
+    first.start()
+    assert holder_entered.wait(1)
+
+    second = threading.Thread(target=contender)
+    second.start()
+    assert contender_started.wait(1)
+    assert not contender_entered.wait(0.05)
+
+    release_holder.set()
+    assert contender_entered.wait(1)
+    first.join(1)
+    second.join(1)
+    assert not first.is_alive()
+    assert not second.is_alive()

@@ -29,7 +29,7 @@ def test_success_is_bounded_and_uses_no_shell(tmp_path):
     assert result.output == "TRNJE_LOCAL_MODEL_OK"
     assert run.call_args.kwargs["shell"] is False
     assert "--simple-io" in run.call_args.args[0]
-    assert run.call_args.kwargs["timeout"] == 120
+    assert run.call_args.kwargs["timeout"] == 10800
 
 
 def test_nonzero_exit_is_failure(tmp_path):
@@ -66,3 +66,4 @@ def test_success_accepts_model_text_on_stderr(tmp_path):
         result = run_local_model("say OK", model_path=model)
     assert result.status == "PASS"
     assert "TRNJE_LOCAL_MODEL_OK" in result.output
+
