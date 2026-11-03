@@ -92,3 +92,49 @@ def test_restore_if_unchanged_refuses_concurrent_change(tmp_path):
     assert result.status == "BLOCKED"
     assert target.read_text(encoding="utf-8") == "concurrent edit\n"
 
+
+
+def test_workspace_lock_is_released_after_exception(tmp_path):
+    import pytest
+    from trnje.workspace import workspace_lock
+
+    with pytest.raises(RuntimeError):
+        with workspace_lock(tmp_path):
+            raise RuntimeError("simulated task failure")
+
+    # A subsequent acquisition must not remain blocked by the failed task.
+    with workspace_lock(tmp_path):
+        pass
+
+
+def test_workspace_lock_serializes_competing_threads(tmp_path):
+    import threading
+    from trnje.workspace import workspace_lock
+
+    holder_entered = threading.Event()
+    release_holder = threading.Event()
+    contender_entered = threading.Event()
+
+    def holder():
+        with workspace_lock(tmp_path):
+            holder_entered.set()
+            assert release_holder.wait(2)
+
+    def contender():
+        with workspace_lock(tmp_path):
+            contender_entered.set()
+
+    first = threading.Thread(target=holder)
+    first.start()
+    assert holder_entered.wait(1)
+
+    second = threading.Thread(target=contender)
+    second.start()
+    assert not contender_entered.wait(0.05)
+
+    release_holder.set()
+    assert contender_entered.wait(1)
+    first.join(1)
+    second.join(1)
+    assert not first.is_alive()
+    assert not second.is_alive()
