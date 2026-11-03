@@ -51,6 +51,27 @@ class TrnjeTermuxWorkerTests(unittest.TestCase):
             target.write_text("safe", encoding="utf-8")
             self.assertEqual(WORKER.file_in_root(root, "README.md"), target)
 
+    def test_large_file_is_read_in_bounded_chunks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "large.md"
+            target.write_bytes(b"a" * (WORKER.MAX_READ_BYTES + 100))
+            first = WORKER.execute(root, "read_file", {"path": "large.md"})
+            self.assertEqual(first["status"], "PASS")
+            self.assertIn("NEXT_OFFSET: 12000", first["output"])
+            second = WORKER.execute(
+                root, "read_file", {"path": "large.md", "offset": WORKER.MAX_READ_BYTES}
+            )
+            self.assertEqual(second["status"], "PASS")
+            self.assertIn("COMPLETE: true", second["output"])
+            self.assertTrue(second["output"].endswith("a" * 100))
+
+    def test_missing_file_has_a_specific_reason(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = WORKER.execute(Path(directory), "read_file", {"path": "missing.md"})
+            self.assertEqual(result["status"], "BLOCKED")
+            self.assertIn("FILE_NOT_FOUND", result["detail"])
+
     def test_subprocess_disables_shell_and_stdin(self):
         with patch.object(WORKER.subprocess, "run") as mocked:
             mocked.return_value = type(
