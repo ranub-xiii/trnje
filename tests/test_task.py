@@ -15,10 +15,24 @@ def test_extract_edit_requires_exact_schema():
 
 def test_task_stops_when_model_does_not_return_edit(tmp_path):
     (tmp_path / "sample.py").write_text("x = 1\n", encoding="utf-8")
-    with patch("trnje.task.run_local_model", return_value=ModelResult("PASS", output="not json")):
+    with patch(
+        "trnje.task.run_local_model",
+        return_value=ModelResult("PASS", output="not json", returncode=0, elapsed_seconds=1.25),
+    ):
         result = run_task(tmp_path, "sample.py", "change x", expected_text="x = 2")
     assert result.status == "BLOCKED"
     assert result.phase == "proposal"
+    metadata = result.as_dict()["model"]
+    assert metadata == {
+        "status": "PASS",
+        "returncode": 0,
+        "elapsed_seconds": 1.25,
+        "output_bytes": 8,
+        "error": "",
+        "rejection_reason": "invalid_edit_json",
+    }
+    assert "output" not in metadata
+    assert "not json" not in str(metadata)
     assert (tmp_path / "sample.py").read_text(encoding="utf-8") == "x = 1\n"
 
 
