@@ -273,16 +273,17 @@ def run_task(
     expected_text: str,
     model_timeout_seconds: int = 10800,
     check_timeout_seconds: int = 120,
+    lock_timeout_seconds: float = 5.0,
 ) -> TaskReport:
     """Run a task while holding the workspace-wide cooperative lock."""
-    lock = workspace_lock(workspace)
+    lock = workspace_lock(workspace, timeout_seconds=lock_timeout_seconds)
     try:
         lock.__enter__()
     except (OSError, ValueError) as exc:
         return TaskReport(
             "BLOCKED",
             "lock",
-            f"Could not acquire workspace lock ({type(exc).__name__}).",
+            f"Could not acquire workspace lock: {exc}",
             relative_file,
         )
 
