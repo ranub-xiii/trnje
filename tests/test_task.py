@@ -142,3 +142,73 @@ def test_task_reports_check_failure_when_rollback_is_blocked(tmp_path):
     assert result.changed is True
     assert target.read_text(encoding="utf-8") == "x = 2\\n"
 
+
+
+def test_task_rolls_back_when_post_edit_inspection_is_blocked(tmp_path):
+    from trnje.task import run_task as execute_task
+    from trnje.workspace import inspect_file as real_inspect_file
+
+    target = tmp_path / "sample.py"
+    original = "x = 1\\n"
+    target.write_text(original, encoding="utf-8")
+    model_json = '{"old":"x = 1","new":"x = 2","summary":"correct value"}'
+    calls = 0
+
+    def blocked_second_inspection(workspace, relative_file, *, max_bytes=20000):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            return OperationResult("BLOCKED", "simulated post-edit read failure")
+        return real_inspect_file(workspace, relative_file, max_bytes=max_bytes)
+
+    with patch(
+        "trnje.task.run_local_model",
+        return_value=ModelResult("PASS", output=model_json),
+    ), patch("trnje.task.inspect_file", side_effect=blocked_second_inspection), patch(
+        "trnje.task.run_checks"
+    ) as checks:
+        result = execute_task(
+            tmp_path, "sample.py", "change x to 2", expected_text="x = 2"
+        )
+
+    assert result.status == "BLOCKED"
+    assert result.phase == "edit_verify"
+    assert result.changed is False
+    assert "restored and verified" in result.detail
+    assert target.read_text(encoding="utf-8") == original
+    checks.assert_not_called()
+
+
+def test_task_does_not_rollback_over_concurrent_change_after_blocked_inspection(tmp_path):
+    from trnje.task import run_task as execute_task
+    from trnje.workspace import inspect_file as real_inspect_file
+
+    target = tmp_path / "sample.py"
+    target.write_text("x = 1\\n", encoding="utf-8")
+    model_json = '{"old":"x = 1","new":"x = 2","summary":"correct value"}'
+    calls = 0
+
+    def blocked_after_concurrent_write(workspace, relative_file, *, max_bytes=20000):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            target.write_text("external change\\n", encoding="utf-8")
+            return OperationResult("BLOCKED", "simulated post-edit read failure")
+        return real_inspect_file(workspace, relative_file, max_bytes=max_bytes)
+
+    with patch(
+        "trnje.task.run_local_model",
+        return_value=ModelResult("PASS", output=model_json),
+    ), patch("trnje.task.inspect_file", side_effect=blocked_after_concurrent_write), patch(
+        "trnje.task.run_checks"
+    ) as checks:
+        result = execute_task(
+            tmp_path, "sample.py", "change x to 2", expected_text="x = 2"
+        )
+
+    assert result.status == "FAIL"
+    assert result.phase == "rollback"
+    assert result.changed is True
+    assert "could not be confirmed" in result.detail
+    assert target.read_text(encoding="utf-8") == "external change\\n"
+    checks.assert_not_called()
