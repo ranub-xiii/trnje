@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from trnje.local_model import run_local_model
@@ -18,6 +18,7 @@ class TaskReport:
     summary: str = ""
     checks: str = ""
     changed: bool = False
+    model: dict[str, object] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -28,6 +29,7 @@ class TaskReport:
             "summary": self.summary,
             "checks": self.checks,
             "changed": self.changed,
+            "model": self.model,
         }
 
 
@@ -97,11 +99,33 @@ def _run_task_locked(
         f"FILE: {relative_file}\nFILE CONTENT:\n{inspected.output}"
     )
     proposed = run_local_model(prompt, timeout_seconds=model_timeout_seconds, max_tokens=512, context_size=4096)
+    model_metadata: dict[str, object] = {
+        "status": proposed.status,
+        "returncode": proposed.returncode,
+        "elapsed_seconds": round(proposed.elapsed_seconds, 3),
+        "output_bytes": len(proposed.output.encode("utf-8")),
+        "error": proposed.error[:300],
+    }
     if proposed.status != "PASS" or proposed.output.find("Model output preview:") != -1:
-        return TaskReport(proposed.status if proposed.status != "PASS" else "BLOCKED", "model", proposed.error or "Model output was rejected by the proposal guard.", relative_file)
+        rejection_reason = "inference_failed" if proposed.status != "PASS" else "output_preview_guard"
+        model_metadata["rejection_reason"] = rejection_reason
+        return TaskReport(
+            proposed.status if proposed.status != "PASS" else "BLOCKED",
+            "model",
+            proposed.error or "Model output was rejected by the proposal guard.",
+            relative_file,
+            model=model_metadata,
+        )
     edit = _extract_edit(proposed.output, inspected.output)
     if edit is None:
-        return TaskReport("BLOCKED", "proposal", "Model did not return the required edit JSON.", relative_file)
+        model_metadata["rejection_reason"] = "invalid_edit_json"
+        return TaskReport(
+            "BLOCKED",
+            "proposal",
+            "Model did not return the required edit JSON.",
+            relative_file,
+            model=model_metadata,
+        )
     applied = replace_exact(workspace, relative_file, edit["old"], edit["new"], max_file_bytes=20000)
     if applied.status != "PASS":
         return TaskReport(applied.status, "edit", applied.detail, relative_file, edit["summary"])
