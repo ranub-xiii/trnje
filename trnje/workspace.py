@@ -11,6 +11,7 @@ import subprocess
 import fcntl
 import hashlib
 import tempfile
+import time
 from contextlib import contextmanager
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -27,8 +28,18 @@ class OperationResult:
 
 
 @contextmanager
-def workspace_lock(workspace: str | os.PathLike[str]) -> Iterator[None]:
-    """Serialize cooperating task runners for the same resolved workspace."""
+def workspace_lock(
+    workspace: str | os.PathLike[str],
+    *,
+    timeout_seconds: float = 5.0,
+) -> Iterator[None]:
+    """Serialize cooperating task runners with a bounded lock wait."""
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not 0 < timeout_seconds <= 60
+    ):
+        raise ValueError("Lock timeout must be greater than 0 and at most 60 seconds.")
     root = Path(workspace).resolve(strict=True)
     if not root.is_dir():
         raise ValueError("Workspace must be a directory.")
@@ -36,8 +47,19 @@ def workspace_lock(workspace: str | os.PathLike[str]) -> Iterator[None]:
     lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     digest = hashlib.sha256(os.fsencode(str(root))).hexdigest()
     lock_path = lock_dir / f"{digest}.lock"
+    deadline = time.monotonic() + timeout_seconds
     with lock_path.open("a+b") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"Workspace lock acquisition timed out after {timeout_seconds:g} seconds."
+                    )
+                time.sleep(min(0.05, remaining))
         try:
             yield
         finally:
