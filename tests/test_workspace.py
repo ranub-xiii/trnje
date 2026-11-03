@@ -19,6 +19,19 @@ def test_replace_exact_only_changes_one_unique_match(tmp_path):
     assert target.read_text(encoding="utf-8") == "alpha gamma"
 
 
+def test_replace_exact_preserves_restrictive_and_executable_modes(tmp_path):
+    for mode in (0o600, 0o755):
+        target = tmp_path / f"mode-{mode:o}.txt"
+        target.write_text("before", encoding="utf-8")
+        target.chmod(mode)
+
+        result = replace_exact(tmp_path, target.name, "before", "after")
+
+        assert result.status == "PASS"
+        assert target.read_text(encoding="utf-8") == "after"
+        assert target.stat().st_mode & 0o777 == mode
+
+
 def test_replace_exact_refuses_noop_replacement(tmp_path):
     target = tmp_path / "a.txt"
     target.write_text("unchanged", encoding="utf-8")
@@ -72,11 +85,13 @@ def test_restore_if_unchanged_restores_original_content(tmp_path):
     target.write_text("bad edit\n", encoding="utf-8")
 
     result = restore_if_unchanged(
-        tmp_path, "a.txt", expected_current="bad edit\n", original_content="original\n"
+        tmp_path, "a.txt", expected_current="bad edit\n", original_content="original\n",
+        original_mode=0o600,
     )
 
     assert result.status == "PASS"
     assert target.read_text(encoding="utf-8") == "original\n"
+    assert target.stat().st_mode & 0o777 == 0o600
 
 
 def test_restore_if_unchanged_refuses_concurrent_change(tmp_path):
