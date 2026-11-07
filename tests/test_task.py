@@ -228,3 +228,27 @@ def test_task_does_not_rollback_over_concurrent_change_after_blocked_inspection(
     assert "could not be confirmed" in result.detail
     assert target.read_text(encoding="utf-8") == "external change\\n"
     checks.assert_not_called()
+
+
+def test_task_rejects_preexisting_acceptance_text_before_model_call(tmp_path):
+    target = tmp_path / "sample.py"
+    original = "x = 2\\n# unrelated value\\n"
+    target.write_text(original, encoding="utf-8")
+
+    with patch("trnje.task.run_local_model") as model, patch(
+        "trnje.task.run_checks"
+    ) as checks:
+        result = run_task(
+            tmp_path,
+            "sample.py",
+            "change another value",
+            expected_text="x = 2",
+        )
+
+    assert result.status == "FAIL"
+    assert result.phase == "acceptance"
+    assert result.changed is False
+    assert "already existed before the edit" in result.detail
+    assert target.read_text(encoding="utf-8") == original
+    model.assert_not_called()
+    checks.assert_not_called()
