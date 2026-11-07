@@ -85,6 +85,15 @@ def _run_task_locked(
     if inspected.status != "PASS":
         return TaskReport(inspected.status, "inspect", inspected.detail, relative_file)
 
+    # Existing text cannot prove that this task produced the requested result.
+    if expected_text in inspected.output:
+        return TaskReport(
+            "FAIL",
+            "acceptance",
+            "Expected text already existed before the edit; it cannot prove this task made the required change.",
+            relative_file,
+        )
+
     prompt = (
         "You are proposing one minimal source-code edit. Return exactly one JSON object "
         'with string keys "old", "new", and "summary". "old" must be a non-empty exact '
