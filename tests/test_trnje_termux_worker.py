@@ -228,15 +228,7 @@ class TrnjeTermuxWorkerTests(unittest.TestCase):
 
         installer = (Path(__file__).resolve().parents[1] /
                      "scripts" / "install_trnje_termux_worker.sh").read_text(encoding="utf-8")
-        match = re.search(r'^expected_sha256="([0-9a-f]{64})"
-        self.assertIsNotNone(match)
-        self.assertEqual(match.group(1), hashlib.sha256(WORKER_PATH.read_bytes()).hexdigest())
-        self.assertIn('worker_ref="${TRNJE_WORKER_REF:-main}"', installer)
-
-
-if __name__ == "__main__":
-    unittest.main()
-, installer, re.MULTILINE)
+        match = re.search(r'^expected_sha256="([0-9a-f]{64})"$', installer, re.MULTILINE)
         self.assertIsNotNone(match)
         self.assertEqual(match.group(1), hashlib.sha256(WORKER_PATH.read_bytes()).hexdigest())
         self.assertIn('worker_ref="${TRNJE_WORKER_REF:-main}"', installer)
