@@ -60,7 +60,7 @@ trap cleanup EXIT HUP INT TERM
 gh api "repos/ranub-xiii/trnje/contents/scripts/trnje_termux_worker.py?ref=${worker_ref}" --jq .content |
   python -c 'import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))' > "$tmp"
 
-expected_sha256="26c56fe1f6be07f9955ebaff0c2dbf8b07577b5172aa2a200327c7c926fa4c05"
+expected_sha256="ca35a523e251708ac45aa80b677be3088ff44c055b6858f323a6bb7f7f5511a8"
 actual_sha256="$(python -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$tmp")"
 [ "$actual_sha256" = "$expected_sha256" ] || fail "Worker SHA-256 does not match the installer pin."
 
