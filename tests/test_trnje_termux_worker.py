@@ -72,6 +72,74 @@ class TrnjeTermuxWorkerTests(unittest.TestCase):
             self.assertEqual(result["status"], "BLOCKED")
             self.assertIn("FILE_NOT_FOUND", result["detail"])
 
+
+    def test_gh_retries_tls_handshake_timeout_then_succeeds(self):
+        failed = type("Completed", (), {
+            "returncode": 1, "stdout": "",
+            "stderr": "Get \\"https://api.github.com/...\\": net/http: TLS handshake timeout",
+        })()
+        succeeded = type("Completed", (), {
+            "returncode": 0, "stdout": '[{"id":1}]', "stderr": "",
+        })()
+        with patch.object(WORKER.subprocess, "run", side_effect=[failed, failed, succeeded]) as run, \\
+             patch.object(WORKER.time, "sleep") as sleep:
+            result = WORKER.gh(["repos/example"], timeout=45)
+        self.assertEqual(result, '[{"id":1}]')
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 5])
+
+    def test_gh_stops_after_three_transient_failures(self):
+        failed = type("Completed", (), {
+            "returncode": 1, "stdout": "",
+            "stderr": "net/http: TLS handshake timeout",
+        })()
+        with patch.object(WORKER.subprocess, "run", return_value=failed) as run, \\
+             patch.object(WORKER.time, "sleep") as sleep:
+            with self.assertRaises(WORKER.Blocked) as raised:
+                WORKER.gh(["repos/example"], timeout=45)
+        self.assertIn("after 3 attempts", str(raised.exception))
+        self.assertIn("retry limit reached", str(raised.exception))
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 5])
+
+    def test_gh_does_not_retry_permission_errors(self):
+        forbidden = type("Completed", (), {
+            "returncode": 1, "stdout": "",
+            "stderr": "HTTP 403: Resource not accessible by integration",
+        })()
+        with patch.object(WORKER.subprocess, "run", return_value=forbidden) as run, \\
+             patch.object(WORKER.time, "sleep") as sleep:
+            with self.assertRaises(WORKER.Blocked) as raised:
+                WORKER.gh(["repos/example"])
+        self.assertIn("non-retryable error", str(raised.exception))
+        run.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_gh_retries_http_5xx_but_not_arbitrary_server_errors(self):
+        unavailable = type("Completed", (), {
+            "returncode": 1, "stdout": "",
+            "stderr": "HTTP 503: Service Unavailable",
+        })()
+        succeeded = type("Completed", (), {
+            "returncode": 0, "stdout": "ok", "stderr": "",
+        })()
+        with patch.object(WORKER.subprocess, "run", side_effect=[unavailable, succeeded]) as run, \\
+             patch.object(WORKER.time, "sleep") as sleep:
+            self.assertEqual(WORKER.gh(["repos/example"]), "ok")
+        self.assertEqual(run.call_count, 2)
+        sleep.assert_called_once_with(2)
+
+    def test_gh_retries_process_timeout_with_a_bounded_attempt_count(self):
+        succeeded = type("Completed", (), {
+            "returncode": 0, "stdout": "ok", "stderr": "",
+        })()
+        with patch.object(WORKER.subprocess, "run",
+                          side_effect=[WORKER.subprocess.TimeoutExpired("gh", 30), succeeded]) as run, \\
+             patch.object(WORKER.time, "sleep") as sleep:
+            self.assertEqual(WORKER.gh(["repos/example"]), "ok")
+        self.assertEqual(run.call_count, 2)
+        sleep.assert_called_once_with(2)
+
     def test_empty_mailbox_poll_updates_heartbeat(self):
         state = {"version": 1, "last_seen": 0, "tasks": {}}
         with patch.object(WORKER, "comments", return_value=[]), \
