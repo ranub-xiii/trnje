@@ -81,7 +81,7 @@ class TrnjeTermuxWorkerTests(unittest.TestCase):
         succeeded = type("Completed", (), {
             "returncode": 0, "stdout": '[{"id":1}]', "stderr": "",
         })()
-        with patch.object(WORKER.subprocess, "run", side_effect=[failed, failed, succeeded]) as run, \\
+        with patch.object(WORKER.subprocess, "run", side_effect=[failed, failed, succeeded]) as run, \
              patch.object(WORKER.time, "sleep") as sleep:
             result = WORKER.gh(["repos/example"], timeout=45)
         self.assertEqual(result, '[{"id":1}]')
@@ -93,7 +93,7 @@ class TrnjeTermuxWorkerTests(unittest.TestCase):
             "returncode": 1, "stdout": "",
             "stderr": "net/http: TLS handshake timeout",
         })()
-        with patch.object(WORKER.subprocess, "run", return_value=failed) as run, \\
+        with patch.object(WORKER.subprocess, "run", return_value=failed) as run, \
              patch.object(WORKER.time, "sleep") as sleep:
             with self.assertRaises(WORKER.Blocked) as raised:
                 WORKER.gh(["repos/example"], timeout=45)
@@ -107,7 +107,7 @@ class TrnjeTermuxWorkerTests(unittest.TestCase):
             "returncode": 1, "stdout": "",
             "stderr": "HTTP 403: Resource not accessible by integration",
         })()
-        with patch.object(WORKER.subprocess, "run", return_value=forbidden) as run, \\
+        with patch.object(WORKER.subprocess, "run", return_value=forbidden) as run, \
              patch.object(WORKER.time, "sleep") as sleep:
             with self.assertRaises(WORKER.Blocked) as raised:
                 WORKER.gh(["repos/example"])
@@ -123,7 +123,7 @@ class TrnjeTermuxWorkerTests(unittest.TestCase):
         succeeded = type("Completed", (), {
             "returncode": 0, "stdout": "ok", "stderr": "",
         })()
-        with patch.object(WORKER.subprocess, "run", side_effect=[unavailable, succeeded]) as run, \\
+        with patch.object(WORKER.subprocess, "run", side_effect=[unavailable, succeeded]) as run, \
              patch.object(WORKER.time, "sleep") as sleep:
             self.assertEqual(WORKER.gh(["repos/example"]), "ok")
         self.assertEqual(run.call_count, 2)
@@ -134,7 +134,7 @@ class TrnjeTermuxWorkerTests(unittest.TestCase):
             "returncode": 0, "stdout": "ok", "stderr": "",
         })()
         with patch.object(WORKER.subprocess, "run",
-                          side_effect=[WORKER.subprocess.TimeoutExpired("gh", 30), succeeded]) as run, \\
+                          side_effect=[WORKER.subprocess.TimeoutExpired("gh", 30), succeeded]) as run, \
              patch.object(WORKER.time, "sleep") as sleep:
             self.assertEqual(WORKER.gh(["repos/example"]), "ok")
         self.assertEqual(run.call_count, 2)
