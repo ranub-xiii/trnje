@@ -97,7 +97,7 @@ class TrnjeTermuxWorkerTests(unittest.TestCase):
              patch.object(WORKER.time, "sleep") as sleep:
             with self.assertRaises(WORKER.Blocked) as raised:
                 WORKER.gh(["repos/example"], timeout=45)
-        self.assertIn("after 3 attempts", str(raised.exception))
+        self.assertIn("after 3 attempt", str(raised.exception))
         self.assertIn("retry limit reached", str(raised.exception))
         self.assertEqual(run.call_count, 3)
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 5])
