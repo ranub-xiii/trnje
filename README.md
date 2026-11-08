@@ -4,11 +4,36 @@
 
 ## Current status
 
-**Initial project approved; implementation not yet started.** The private repository exists. The initial design and acceptance criteria are being committed before implementation.
+**Prototype implementation has started on `feat/local-model-adapter`.** The branch adds a bounded `llama-cli` adapter, a smoke-test command, and unit tests for success and failure handling. This is not yet a complete coding agent, and no acceptance test AT-01 through AT-14 is claimed as passed.
+
+## Local model adapter
+
+The adapter uses only a local `llama-cli` process. It does not call a remote provider or silently fall back to a paid service. Configure the model path explicitly:
+
+```bash
+export TRNJE_MODEL_PATH="$HOME/models/qwen2.5-coder-0.5b-instruct-q4_0.gguf"
+python scripts/model_smoke.py
+```
+
+The command uses a bounded timeout and token count, emits a JSON result, and returns a nonzero exit code unless the expected marker appears in model output. To run unit tests, use `python -m pytest -q`.
+
+## Minimal task loop (experimental)
+
+The first task loop is intentionally narrow: it inspects one explicitly selected file, asks the local model for one exact text replacement, applies it only if the old text matches exactly once, and runs the fixed repository checks. It does not retry, run model-supplied shell commands, commit, push, or merge. If verification fails after an edit, the changed file is left in place and the JSON report says so; inspect the diff before continuing.
+
+```bash
+export TRNJE_MODEL_PATH="$HOME/models/qwen2.5-coder-0.5b-instruct-q4_0.gguf"
+python scripts/run_task.py \
+  --workspace "$HOME/trnje" \
+  --file "path/inside/project.py" \
+  --task "Describe one small, testable correction"
+```
+
+Use a real relative path and a narrow task. This is an experimental one-file loop, not proof of full autonomous coding capability. Its output is a JSON report; exit code 0 means the fixed checks passed, not that the task was independently judged correct.
 
 ## Prototype goal
 
-For one bounded coding task, the first prototype should inspect the project, make a scoped change, run relevant checks, attempt a limited repair when justified, preserve progress across interruption, and report the observed result with evidence.
+For one bounded coding task, the first prototype should inspect the project, make a scoped fix, run relevant checks, attempt a limited repair when justified, preserve progress across interruption, and report the observed result with evidence.
 
 ## Operating principles
 
@@ -19,7 +44,7 @@ For one bounded coding task, the first prototype should inspect the project, mak
 - A success claim requires execution evidence. Missing or unverifiable evidence is not a pass.
 - Automatic merge is allowed only after all applicable mandatory checks and policy gates pass.
 
-The canonical design and authority boundaries are in [`DESIGN.md`](DESIGN.md). The 16 acceptance tests and release gate are in [`ACCEPTANCE_TESTS.md`](ACCEPTANCE_TESTS.md).
+The canonical design and authority boundaries are in [DESIGN.md](DESIGN.md). The 16 acceptance tests and release gate are in [ACCEPTANCE_TESTS.md](ACCEPTANCE_TESTS.md).
 
 ## Initial phases
 

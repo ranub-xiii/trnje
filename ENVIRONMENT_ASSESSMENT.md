@@ -2,7 +2,7 @@
 
 ## Status
 
-**Status: BLOCKED for environment selection; implementation has not started.**
+**Status: BLOCKED for environment selection; prototype implementation is in progress.**
 
 This document defines the evidence needed to select Trnje's first execution environment. Prior conversation records are leads, not a substitute for a fresh, reproducible inventory from the current Termux session. Do not describe any option as benchmarked until the procedure below has actually run and its output has been saved.
 
@@ -112,10 +112,11 @@ Use legitimate options instead: wait for the provider's stated reset, inspect th
 ## Evidence status
 
 - Inventory helper: **PASS — committed and read back from GitHub** ([script](scripts/inventory_termux.sh), commit `22725c3e2ccdd21931d2db7f81ddcf86c249dad2`). This verifies repository persistence only, not script execution.
-- Current Termux inventory: **UNKNOWN — helper not run in the device shell; no direct Termux execution channel is available in this session**.
-- GitHub Actions availability: **UNKNOWN — code search returned no indexed workflow results and the inventory commit has no reported status contexts; neither observation proves Actions are disabled**.
-- Termux-first benchmark: **UNKNOWN — not run**.
-- Hybrid benchmark: **UNKNOWN — not run**.
+- Local model adapter on Termux: **PASS — user-provided execution output on 2026-10-29**. `python -m pytest -q`: 6 passed; `python -m compileall -q trnje scripts tests`: exit 0; `python scripts/model_smoke.py`: JSON status `PASS`, process return code 0, expected marker present, smoke exit code 0. The observed generation rate in this run was 13.0 tokens/s. This validates the adapter smoke path, not coding-task completion or reliability.
+- Current Termux inventory: **UNKNOWN — helper has not been run and returned as a report in the available evidence**.
+- GitHub Actions workflow: **PASS — run 40880419835, conclusion `success`** for workflow commit `055b94657daaddc2af85fececd0031e6f7e483c2`. The `test` job completed checkout, Python setup, pytest, and compileall successfully. This confirms the workflow runs; it is not evidence that every later commit has its own run.
+- Termux-first benchmark: **UNKNOWN — adapter smoke only; representative coding task, interruption recovery, background survival, resource and thermal measures not yet benchmarked**.
+- Hybrid benchmark: **UNKNOWN — workflow exists but no Actions run or same-task comparative benchmark has been observed**.
 - Separate-host benchmark: **UNKNOWN — availability not established**.
-- Environment selection: **BLOCKED pending evidence**.
-- Trnje implementation: **not started**.
+- Environment selection: **BLOCKED pending comparable benchmark evidence**.
+- Trnje implementation: **IN PROGRESS — bounded local-model adapter exists; full task inspect/edit/test/verify/report loop is not yet implemented or accepted**.
