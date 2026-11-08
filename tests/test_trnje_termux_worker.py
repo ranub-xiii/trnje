@@ -284,11 +284,11 @@ class TrnjeTermuxWorkerTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "PASS")
             self.assertEqual(captured["expected_text"], payload["expect"])
-            self.assertEqual(captured["model_timeout_seconds"], 10800)
+            self.assertEqual(captured["model_timeout_seconds"], 300)
             self.assertEqual(captured["check_timeout_seconds"], 180)
             self.assertIn("--expect", calls[0][0])
             self.assertIn(payload["expect"], calls[0][0])
-            self.assertEqual(calls[0][1], 11100)
+            self.assertEqual(calls[0][1], 600)
 
     def test_installer_sha256_pin_matches_worker_source(self):
         import hashlib
