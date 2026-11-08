@@ -115,15 +115,47 @@ def save(s: dict) -> None:
         tmp.unlink(missing_ok=True)
 
 
+GH_RETRY_DELAYS = (2, 5)
+GH_TRANSIENT_ERROR = re.compile(
+    r"(?i)(TLS handshake timeout|i/o timeout|connection reset by peer|"
+    r"connection timed out|temporary failure in name resolution|"
+    r"unexpected EOF|unexpected end of file|HTTP 5[0-9]{2})"
+)
+
+
 def gh(args: list[str], timeout: int = 30) -> str:
-    try:
-        p = subprocess.run(["gh", "api", *args], stdin=subprocess.DEVNULL, capture_output=True,
-                           text=True, timeout=timeout, check=False, shell=False, env=env())
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise Blocked(f"GitHub API request failed ({type(exc).__name__}).")
-    if p.returncode:
-        raise Blocked("GitHub API request failed: " + clean(p.stderr or p.stdout)[:400])
-    return p.stdout
+    """Call GitHub CLI, retrying only bounded, recognizable transient failures."""
+    command = ["gh", "api", *args]
+    for attempt in range(len(GH_RETRY_DELAYS) + 1):
+        try:
+            p = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
+                               text=True, timeout=timeout, check=False, shell=False, env=env())
+        except subprocess.TimeoutExpired as exc:
+            if attempt < len(GH_RETRY_DELAYS):
+                time.sleep(GH_RETRY_DELAYS[attempt])
+                continue
+            raise Blocked(
+                f"GitHub API request failed after {attempt + 1} attempts "
+                f"(TimeoutExpired; retry limit reached)."
+            ) from exc
+        except OSError as exc:
+            # Missing executables and local configuration errors are not network retries.
+            raise Blocked(f"GitHub API request failed ({type(exc).__name__}).") from exc
+
+        if p.returncode == 0:
+            return p.stdout
+
+        error = clean(p.stderr or p.stdout)
+        transient = bool(GH_TRANSIENT_ERROR.search(error))
+        if transient and attempt < len(GH_RETRY_DELAYS):
+            time.sleep(GH_RETRY_DELAYS[attempt])
+            continue
+        reason = "retry limit reached" if transient else "non-retryable error"
+        raise Blocked(
+            f"GitHub API request failed after {attempt + 1} attempt(s) "
+            f"({reason}): {error[:400]}"
+        )
+    raise Blocked("GitHub API request failed: retry loop exhausted.")
 
 
 def verify_gh() -> str:
@@ -319,9 +351,9 @@ def execute(r: Path, kind: str, p: dict) -> dict:
         if not runner.is_file():
             return {"status": "BLOCKED", "detail": "scripts/run_task.py missing.", "exit": None, "output": ""}
         cmd = [sys.executable, str(runner), "--workspace", str(r), "--file", p["file"],
-               "--task", p["task"], "--expect", p["expect"], "--model-timeout", "10800", "--check-timeout", "180"]
+               "--task", p["task"], "--expect", p["expect"], "--model-timeout", "300", "--check-timeout", "180"]
         # Allow the model timeout plus check execution and process startup/teardown.
-        x = call(cmd, r, 11100)
+        x = call(cmd, r, 600)
         after = call(["git", "status", "--short"], r, 20)
         diff = call(["git", "diff", "--stat"], r, 20)
         x["output"] = (x["output"] + "\n\nPost-task worktree:\n"
