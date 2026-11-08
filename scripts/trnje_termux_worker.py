@@ -351,9 +351,9 @@ def execute(r: Path, kind: str, p: dict) -> dict:
         if not runner.is_file():
             return {"status": "BLOCKED", "detail": "scripts/run_task.py missing.", "exit": None, "output": ""}
         cmd = [sys.executable, str(runner), "--workspace", str(r), "--file", p["file"],
-               "--task", p["task"], "--expect", p["expect"], "--model-timeout", "10800", "--check-timeout", "180"]
+               "--task", p["task"], "--expect", p["expect"], "--model-timeout", "300", "--check-timeout", "180"]
         # Allow the model timeout plus check execution and process startup/teardown.
-        x = call(cmd, r, 11100)
+        x = call(cmd, r, 600)
         after = call(["git", "status", "--short"], r, 20)
         diff = call(["git", "diff", "--stat"], r, 20)
         x["output"] = (x["output"] + "\n\nPost-task worktree:\n"
