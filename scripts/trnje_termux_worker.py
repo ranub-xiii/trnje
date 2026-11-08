@@ -119,7 +119,7 @@ GH_RETRY_DELAYS = (2, 5)
 GH_TRANSIENT_ERROR = re.compile(
     r"(?i)(TLS handshake timeout|i/o timeout|connection reset by peer|"
     r"connection timed out|temporary failure in name resolution|"
-    r"unexpected EOF|unexpected end of file|server returned HTTP 5\\d\\d)"
+    r"unexpected EOF|unexpected end of file|HTTP 5[0-9]{2})"
 )
 
 
