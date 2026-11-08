@@ -76,7 +76,7 @@ class TrnjeTermuxWorkerTests(unittest.TestCase):
     def test_gh_retries_tls_handshake_timeout_then_succeeds(self):
         failed = type("Completed", (), {
             "returncode": 1, "stdout": "",
-            "stderr": "Get \\"https://api.github.com/...\\": net/http: TLS handshake timeout",
+            "stderr": 'Get "https://api.github.com/...": net/http: TLS handshake timeout',
         })()
         succeeded = type("Completed", (), {
             "returncode": 0, "stdout": '[{"id":1}]', "stderr": "",
