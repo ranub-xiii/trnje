@@ -25,3 +25,5 @@ jobs:
         run: python -m pytest -q
       - name: Compile source and tests
         run: python -m compileall -q trnje scripts tests
+      - name: Validate Termux installer shell syntax
+        run: bash -n scripts/install_trnje_termux_worker.sh

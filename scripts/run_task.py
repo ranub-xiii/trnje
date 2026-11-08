@@ -15,13 +15,15 @@ def main() -> int:
     parser.add_argument("--workspace", required=True, help="Existing project workspace")
     parser.add_argument("--file", required=True, help="One relative file to inspect and edit")
     parser.add_argument("--task", required=True, help="Bounded task description")
-    parser.add_argument("--model-timeout", type=int, default=120)
+    parser.add_argument("--expect", required=True, help="Exact text that must be present after editing")
+    parser.add_argument("--model-timeout", type=int, default=10800)
     parser.add_argument("--check-timeout", type=int, default=120)
     args = parser.parse_args()
     report = run_task(
         args.workspace,
         args.file,
         args.task,
+        expected_text=args.expect,
         model_timeout_seconds=args.model_timeout,
         check_timeout_seconds=args.check_timeout,
     )
@@ -31,3 +33,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
