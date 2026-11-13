@@ -35,7 +35,7 @@ DROPBOX_API = "https://api.dropboxapi.com/2"
 DROPBOX_CONTENT = "https://content.dropboxapi.com/2"
 DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token"
 DROPBOX_CONFIG_DEFAULT = HOME / ".config/emberlane/dropbox.env"
-DROPBOX_SOURCE_RE = re.compile(r"\n\n<!-- TRNJE_DROPBOX_SOURCE:([0-9a-f]{64}) -->\s*\Z")
+DROPBOX_SOURCE_RE = re.compile(r"\\n\\n<!-- TRNJE_DROPBOX_SOURCE:([0-9a-f]{64}) -->\\s*\\Z")
 DROPBOX_MAX_PAGES_PER_POLL = 5
 _DROPBOX_ACCESS_TOKEN = ""
 _DROPBOX_ACCESS_TOKEN_EXPIRES = 0.0
@@ -619,7 +619,7 @@ def dropbox_download(token: str, entry: dict) -> bytes:
 
 
 def dropbox_source_marker(file_id: str, revision: str) -> str:
-    digest = hashlib.sha256((file_id + "\0" + revision).encode("utf-8")).hexdigest()
+    digest = hashlib.sha256((file_id + "\\0" + revision).encode("utf-8")).hexdigest()
     return f"<!-- TRNJE_DROPBOX_SOURCE:{digest} -->"
 
 
@@ -675,7 +675,7 @@ def dropbox_ingest(state: dict, items: list[dict]) -> int:
             if "TRNJE_DROPBOX_SOURCE:" in body:
                 raise Blocked("Dropbox task file must not contain forwarding metadata.")
             parse(body)
-            forwarded_body = body.rstrip("\r\n") + "\n\n" + marker
+            forwarded_body = body.rstrip("\\r\\n") + "\\n\\n" + marker
             if len(forwarded_body.encode("utf-8")) > MAX_COMMENT:
                 raise Blocked("Dropbox task plus forwarding metadata exceeds the comment size limit.")
             if not post(forwarded_body):
