@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import fcntl
+import hashlib
+import http.client
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 REPO, ISSUE = "ranub-xiii/trnje", 3
@@ -24,6 +31,14 @@ STATE_FILE, LOCK_FILE = STATE / "state.json", STATE / "worker.lock"
 PUBLISHER = HOME / "bin/trnje-publish"
 MAX_TEXT, MAX_COMMENT = 24_000, 16_384
 MAX_READ_BYTES = 12_000
+DROPBOX_API = "https://api.dropboxapi.com/2"
+DROPBOX_CONTENT = "https://content.dropboxapi.com/2"
+DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token"
+DROPBOX_CONFIG_DEFAULT = HOME / ".config/emberlane/dropbox.env"
+DROPBOX_SOURCE_RE = re.compile(r"\n\n<!-- TRNJE_DROPBOX_SOURCE:([0-9a-f]{64}) -->\s*\Z")
+DROPBOX_MAX_PAGES_PER_POLL = 5
+_DROPBOX_ACCESS_TOKEN = ""
+_DROPBOX_ACCESS_TOKEN_EXPIRES = 0.0
 
 REDACT = [
     re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"),
@@ -167,8 +182,14 @@ def pairs_no_duplicates(pairs):
 def parse(body: str) -> tuple[str, dict]:
     if len(body.encode()) > MAX_COMMENT or not body.startswith(MARK + "\n"):
         raise Blocked("Task marker or size invalid.")
+    raw = body[len(MARK) + 1:]
+    source_match = DROPBOX_SOURCE_RE.search(body)
+    if source_match:
+        raw = body[len(MARK) + 1:source_match.start()]
+    elif "TRNJE_DROPBOX_SOURCE:" in raw:
+        raise Blocked("Dropbox source marker is malformed.")
     try:
-        obj = json.loads(body[len(MARK) + 1:], object_pairs_hook=pairs_no_duplicates)
+        obj = json.loads(raw, object_pairs_hook=pairs_no_duplicates)
     except (ValueError, json.JSONDecodeError):
         raise Blocked("Task JSON malformed or has duplicate keys.")
     if not isinstance(obj, dict) or set(obj) != {"kind", "payload"} or not isinstance(obj["payload"], dict):
@@ -425,6 +446,253 @@ def process(c: dict, s: dict, r: Path) -> None:
     save(s)
 
 
+
+
+def dropbox_config() -> dict[str, str]:
+    """Read the existing Dropbox app credentials without importing Emberlane code."""
+    values = dict(os.environ)
+    config_path = Path(
+        values.get("TRNJE_DROPBOX_CONFIG")
+        or values.get("EMBERLANE_DROPBOX_CONFIG")
+        or str(DROPBOX_CONFIG_DEFAULT)
+    ).expanduser()
+    if config_path.exists():
+        try:
+            if config_path.is_symlink():
+                raise Blocked("Dropbox config must not be a symlink.")
+            if os.name == "posix" and config_path.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+                raise Blocked("Dropbox config permissions are too broad.")
+            for line in config_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key, value = key.strip(), value.strip().strip("\"' ")
+                if (key.startswith("DROPBOX_") or key == "TRNJE_DROPBOX_INBOX") and key not in values:
+                    values[key] = value
+        except Blocked:
+            raise
+        except OSError as exc:
+            raise Blocked(f"Cannot read Dropbox config ({type(exc).__name__}).") from None
+
+    required = ("DROPBOX_APP_KEY", "DROPBOX_APP_SECRET", "DROPBOX_REFRESH_TOKEN")
+    missing = [key for key in required if not values.get(key)]
+    if missing:
+        raise Blocked("BLOCKED_DROPBOX_AUTH: missing " + ", ".join(missing))
+
+    inbox = values.get("TRNJE_DROPBOX_INBOX", "/trnje-inbox").strip()
+    inbox_path = Path(inbox)
+    if (not inbox_path.is_absolute() or inbox_path == Path("/")
+            or "\\" in inbox or any(part in {".", ".."} for part in inbox_path.parts)):
+        raise Blocked("TRNJE_DROPBOX_INBOX must be a non-root absolute app-folder path.")
+    return {
+        "app_key": values["DROPBOX_APP_KEY"],
+        "app_secret": values["DROPBOX_APP_SECRET"],
+        "refresh_token": values["DROPBOX_REFRESH_TOKEN"],
+        "inbox": inbox,
+    }
+
+
+def dropbox_request(
+    url: str,
+    *,
+    headers: dict[str, str],
+    data: bytes = b"",
+    timeout: float = 20.0,
+    max_response_bytes: int = 1_000_000,
+) -> tuple[bytes, dict[str, str]]:
+    """Bounded Dropbox HTTP request; never expose credentials or response bodies."""
+    if type(max_response_bytes) is not int or max_response_bytes < 0:
+        raise ValueError("max_response_bytes must be a non-negative integer")
+    request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read(max_response_bytes + 1)
+            if len(body) > max_response_bytes:
+                raise Blocked("Dropbox response exceeded the configured size limit.")
+            return body, dict(response.headers.items())
+    except urllib.error.HTTPError as exc:
+        raise Blocked(f"Dropbox HTTP {exc.code}.") from None
+    except http.client.HTTPException as exc:
+        raise Blocked(f"Dropbox response error ({type(exc).__name__}).") from None
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise Blocked(f"Dropbox network error ({type(exc).__name__}).") from None
+
+
+def dropbox_access_token(cfg: dict[str, str]) -> str:
+    global _DROPBOX_ACCESS_TOKEN, _DROPBOX_ACCESS_TOKEN_EXPIRES
+    if _DROPBOX_ACCESS_TOKEN and time.time() < _DROPBOX_ACCESS_TOKEN_EXPIRES - 60:
+        return _DROPBOX_ACCESS_TOKEN
+    basic = (cfg["app_key"] + ":" + cfg["app_secret"]).encode("utf-8")
+    form = urllib.parse.urlencode({
+        "grant_type": "refresh_token",
+        "refresh_token": cfg["refresh_token"],
+    }).encode("utf-8")
+    data, _ = dropbox_request(
+        DROPBOX_TOKEN_URL,
+        headers={
+            "Authorization": "Basic " + base64.b64encode(basic).decode("ascii"),
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        data=form,
+        timeout=20,
+        max_response_bytes=65_536,
+    )
+    try:
+        result = json.loads(data)
+    except (ValueError, UnicodeDecodeError):
+        raise Blocked("Dropbox OAuth response was invalid.") from None
+    token = result.get("access_token") if isinstance(result, dict) else None
+    expires = result.get("expires_in") if isinstance(result, dict) else None
+    if not isinstance(token, str) or not token:
+        raise Blocked("Dropbox OAuth response did not contain an access token.")
+    _DROPBOX_ACCESS_TOKEN = token
+    _DROPBOX_ACCESS_TOKEN_EXPIRES = (
+        time.time() + expires if type(expires) is int and expires > 0 else time.time()
+    )
+    return token
+
+
+def dropbox_list_page(token: str, inbox: str, cursor: str | None = None) -> dict:
+    if cursor:
+        endpoint = DROPBOX_API + "/files/list_folder/continue"
+        payload = {"cursor": cursor}
+    else:
+        endpoint = DROPBOX_API + "/files/list_folder"
+        payload = {
+            "path": inbox,
+            "recursive": False,
+            "include_deleted": False,
+            "limit": 100,
+        }
+    data, _ = dropbox_request(
+        endpoint,
+        headers={
+            "Authorization": "Bearer " + token,
+            "Content-Type": "application/json",
+        },
+        data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+        timeout=30,
+        max_response_bytes=1_000_000,
+    )
+    try:
+        result = json.loads(data)
+    except (ValueError, UnicodeDecodeError):
+        raise Blocked("Dropbox returned malformed folder data.") from None
+    if (not isinstance(result, dict) or not isinstance(result.get("entries"), list)
+            or not isinstance(result.get("cursor"), str) or not result["cursor"]
+            or not isinstance(result.get("has_more"), bool)):
+        raise Blocked("Dropbox folder response schema was invalid.")
+    return result
+
+
+def dropbox_download(token: str, entry: dict) -> bytes:
+    file_id, revision, expected_size = entry.get("id"), entry.get("rev"), entry.get("size")
+    if (not isinstance(file_id, str) or not file_id.startswith("id:")
+            or not isinstance(revision, str) or not revision
+            or type(expected_size) is not int or not 1 <= expected_size <= MAX_COMMENT):
+        raise Blocked("Dropbox inbox file metadata was invalid or exceeded the size limit.")
+    data, headers = dropbox_request(
+        DROPBOX_CONTENT + "/files/download",
+        headers={
+            "Authorization": "Bearer " + token,
+            "Dropbox-API-Arg": json.dumps({"path": file_id}, separators=(",", ":")),
+        },
+        timeout=30,
+        max_response_bytes=MAX_COMMENT,
+    )
+    metadata_header = next(
+        (value for key, value in headers.items() if key.lower() == "dropbox-api-result"),
+        None,
+    )
+    if not metadata_header:
+        raise Blocked("Dropbox download omitted its file metadata.")
+    try:
+        metadata = json.loads(metadata_header)
+    except (ValueError, TypeError):
+        raise Blocked("Dropbox download metadata was malformed.") from None
+    if (not isinstance(metadata, dict) or metadata.get("id") != file_id
+            or metadata.get("rev") != revision or metadata.get("size") != expected_size
+            or len(data) != expected_size):
+        raise Blocked("Dropbox inbox file changed during download; retry on the next poll.")
+    return data
+
+
+def dropbox_source_marker(file_id: str, revision: str) -> str:
+    digest = hashlib.sha256((file_id + "\0" + revision).encode("utf-8")).hexdigest()
+    return f"<!-- TRNJE_DROPBOX_SOURCE:{digest} -->"
+
+
+def dropbox_ingest(state: dict, items: list[dict]) -> int:
+    """Forward validated Dropbox task files into the existing authenticated GitHub mailbox."""
+    if os.environ.get("TRNJE_DROPBOX_ENABLED") != "1":
+        return 0
+
+    cfg = dropbox_config()
+    token = dropbox_access_token(cfg)
+    known = set()
+    for comment in items:
+        body = comment.get("body") or ""
+        known.update(re.findall(r"<!-- TRNJE_DROPBOX_SOURCE:([0-9a-f]{64}) -->", body))
+
+    cursor = state.get("dropbox_cursor")
+    if cursor is not None and (not isinstance(cursor, str) or not cursor or len(cursor) > 16_384):
+        raise Blocked("Stored Dropbox cursor is invalid.")
+
+    forwarded = 0
+    for page_number in range(DROPBOX_MAX_PAGES_PER_POLL):
+        try:
+            page = dropbox_list_page(token, cfg["inbox"], cursor)
+        except Blocked as exc:
+            if cursor and "Dropbox HTTP 409" in str(exc):
+                state.pop("dropbox_cursor", None)
+                save(state)
+                cursor = None
+                page = dropbox_list_page(token, cfg["inbox"], None)
+            else:
+                raise
+
+        for entry in page["entries"]:
+            if not isinstance(entry, dict) or entry.get(".tag") != "file":
+                continue
+            name = entry.get("name")
+            if not isinstance(name, str) or not name.lower().endswith(".json"):
+                continue
+
+            file_id, revision = entry.get("id"), entry.get("rev")
+            if not isinstance(file_id, str) or not isinstance(revision, str):
+                raise Blocked("Dropbox inbox file omitted its stable ID or revision.")
+            marker = dropbox_source_marker(file_id, revision)
+            digest = marker.removeprefix("<!-- TRNJE_DROPBOX_SOURCE:").removesuffix(" -->")
+            if digest in known:
+                continue
+
+            raw = dropbox_download(token, entry)
+            try:
+                body = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                raise Blocked("Dropbox task file must be UTF-8.") from None
+            if "TRNJE_DROPBOX_SOURCE:" in body:
+                raise Blocked("Dropbox task file must not contain forwarding metadata.")
+            parse(body)
+            forwarded_body = body.rstrip("\r\n") + "\n\n" + marker
+            if len(forwarded_body.encode("utf-8")) > MAX_COMMENT:
+                raise Blocked("Dropbox task plus forwarding metadata exceeds the comment size limit.")
+            if not post(forwarded_body):
+                raise Blocked("Dropbox task forwarding to GitHub Issue #3 failed.")
+            known.add(digest)
+            forwarded += 1
+
+        next_cursor = page["cursor"]
+        state["dropbox_cursor"] = next_cursor
+        save(state)
+        if not page["has_more"]:
+            break
+        cursor = next_cursor
+
+    return forwarded
+
+
 def recover(s: dict) -> None:
     changed = False
     for key, rec in s["tasks"].items():
@@ -442,6 +710,19 @@ def recover(s: dict) -> None:
 def once(r: Path, s: dict) -> int:
     items = comments()
     deliver(s, items)
+    forwarded = 0
+    if os.environ.get("TRNJE_DROPBOX_ENABLED") == "1":
+        try:
+            forwarded = dropbox_ingest(s, items)
+            s["last_dropbox_poll_at"] = int(time.time())
+            s["last_dropbox_poll_status"] = "PASS"
+            s.pop("last_dropbox_poll_error", None)
+        except Blocked as exc:
+            # Dropbox is an optional input channel; its outage must not block GitHub Issue #3.
+            s["last_dropbox_poll_at"] = int(time.time())
+            s["last_dropbox_poll_status"] = "BLOCKED"
+            s["last_dropbox_poll_error"] = clean(str(exc))[:300]
+        save(s)
     n = 0
     for c in items:
         if c["id"] <= int(s.get("last_seen", 0)):
@@ -455,7 +736,7 @@ def once(r: Path, s: dict) -> int:
     s["last_poll_status"] = "PASS"
     s.pop("last_poll_error", None)
     save(s)
-    return n
+    return n + forwarded
 
 
 def main() -> int:
@@ -483,7 +764,7 @@ def main() -> int:
             try:
                 n = once(r, s)
                 if n:
-                    print(f"Scanned {n} new mailbox comments.", flush=True)
+                    print(f"Scanned {n} new mailbox items (GitHub and Dropbox forwards).", flush=True)
             except Blocked as exc:
                 s["last_poll_at"] = int(time.time())
                 s["last_poll_status"] = "BLOCKED"
