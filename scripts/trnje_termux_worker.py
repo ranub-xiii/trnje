@@ -675,7 +675,7 @@ def dropbox_ingest(state: dict, items: list[dict]) -> int:
             if "TRNJE_DROPBOX_SOURCE:" in body:
                 raise Blocked("Dropbox task file must not contain forwarding metadata.")
             parse(body)
-            forwarded_body = body.rstrip("\\r\\n") + "\\n\\n" + marker
+            forwarded_body = body.rstrip("\r\n") + "\n\n" + marker
             if len(forwarded_body.encode("utf-8")) > MAX_COMMENT:
                 raise Blocked("Dropbox task plus forwarding metadata exceeds the comment size limit.")
             if not post(forwarded_body):
