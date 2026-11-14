@@ -14,8 +14,12 @@ from trnje_api_queue import IdempotencyConflict, TaskQueue
 from trnje_mcp_http import (
     MCPConfig,
     MCPConfigurationError,
+    MODERN_PROTOCOL_VERSION,
+    InsufficientScope,
+    InvalidToken,
     OAuthError,
     OAuthIntrospection,
+    OAuthUnavailable,
     READ_SCOPE,
     WRITE_SCOPE,
     create_server,
@@ -28,9 +32,9 @@ class FakeAuth:
 
     def verify(self, authorization, required_scope):
         if authorization != "Bearer test-access-token":
-            raise OAuthError("invalid token")
+            raise InvalidToken("invalid token")
         if required_scope not in self.scopes:
-            raise OAuthError("insufficient scope")
+            raise InsufficientScope("insufficient scope")
         return {"scopes": sorted(self.scopes)}
 
 
@@ -84,7 +88,10 @@ def running_server(tmp_path):
         server.close()
 
 
-def request(server, message, *, token="test-access-token", origin=None):
+def request(
+    server, message, *, token="test-access-token", origin=None,
+    mcp_headers=True, header_overrides=None,
+):
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
@@ -93,6 +100,29 @@ def request(server, message, *, token="test-access-token", origin=None):
         headers["Authorization"] = "Bearer " + token
     if origin is not None:
         headers["Origin"] = origin
+
+    params = message.get("params", {})
+    method = message.get("method")
+    meta = params.get("_meta", {}) if isinstance(params, dict) else {}
+    version = meta.get("io.modelcontextprotocol/protocolVersion")
+    if mcp_headers and isinstance(version, str):
+        headers["MCP-Protocol-Version"] = version
+        headers["Mcp-Method"] = method
+        if method in ("tools/call", "prompts/get"):
+            name = params.get("name")
+            if isinstance(name, str):
+                headers["Mcp-Name"] = name
+        elif method == "resources/read":
+            uri = params.get("uri")
+            if isinstance(uri, str):
+                headers["Mcp-Name"] = uri
+
+    for key, value in (header_overrides or {}).items():
+        if value is None:
+            headers.pop(key, None)
+        else:
+            headers[key] = value
+
     req = urllib.request.Request(
         server.url,
         data=json.dumps(message).encode("utf-8"),
@@ -106,12 +136,21 @@ def request(server, message, *, token="test-access-token", origin=None):
         return exc.code, exc.headers, exc.read()
 
 
-def rpc(method, params=None, request_id=1):
+def rpc(method, params=None, request_id=1, *, modern=True, protocol_version=MODERN_PROTOCOL_VERSION):
+    params = dict(params or {})
+    if modern:
+        meta = dict(params.get("_meta", {}))
+        meta["io.modelcontextprotocol/protocolVersion"] = protocol_version
+        meta.setdefault("io.modelcontextprotocol/clientInfo", {
+            "name": "trnje-tests", "version": "1.0"
+        })
+        meta.setdefault("io.modelcontextprotocol/clientCapabilities", {})
+        params["_meta"] = meta
     return {
         "jsonrpc": "2.0",
         "id": request_id,
         "method": method,
-        "params": params or {},
+        "params": params,
     }
 
 
@@ -133,10 +172,70 @@ def test_protected_resource_metadata_is_available(running_server):
     assert set(metadata["scopes_supported"]) == {READ_SCOPE, WRITE_SCOPE}
 
 
+def test_server_discover_reports_modern_protocol(running_server):
+    status, _, body = request(running_server, rpc("server/discover"))
+    result = json.loads(body)["result"]
+    assert status == 200
+    assert result["resultType"] == "complete"
+    assert result["supportedVersions"] == [MODERN_PROTOCOL_VERSION]
+    assert result["capabilities"] == {"tools": {}}
+    assert result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"] == "trnje"
+
+
+def test_modern_request_requires_protocol_header(running_server):
+    status, _, body = request(
+        running_server, rpc("tools/list"), mcp_headers=False
+    )
+    assert status == 400
+    assert json.loads(body)["error"]["code"] == -32020
+
+
+def test_modern_request_requires_matching_method_header(running_server):
+    status, _, body = request(
+        running_server, rpc("tools/list"),
+        header_overrides={"Mcp-Method": "tools/call"},
+    )
+    assert status == 400
+    assert json.loads(body)["error"]["code"] == -32020
+
+
+def test_modern_tool_call_requires_matching_name_header(running_server):
+    status, _, body = request(
+        running_server, tool_call("trnje_health", {}),
+        header_overrides={"Mcp-Name": "trnje_submit_task"},
+    )
+    assert status == 400
+    assert json.loads(body)["error"]["code"] == -32020
+    assert running_server.wake_count == 0
+
+
+def test_modern_protocol_header_must_match_request_metadata(running_server):
+    status, _, body = request(
+        running_server, rpc("tools/list"),
+        header_overrides={"MCP-Protocol-Version": "2025-11-25"},
+    )
+    assert status == 400
+    assert json.loads(body)["error"]["code"] == -32020
+
+
+def test_unknown_modern_protocol_returns_supported_versions(running_server):
+    status, _, body = request(
+        running_server,
+        rpc("tools/list", protocol_version="2099-01-01"),
+    )
+    message = json.loads(body)
+    assert status == 400
+    assert message["error"]["code"] == -32022
+    assert message["error"]["data"] == {
+        "supported": [MODERN_PROTOCOL_VERSION],
+        "requested": "2099-01-01",
+    }
+
+
 def test_initialize_and_tools_list_follow_json_rpc(running_server):
     status, _, body = request(
         running_server,
-        rpc("initialize", {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}),
+        rpc("initialize", {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}, modern=False),
     )
     assert status == 200
     initialized = json.loads(body)
@@ -253,9 +352,26 @@ def test_write_tool_requires_write_scope(tmp_path):
                 "kind": "diagnostics", "payload": {}, "idempotency_key": "no-write"
             }),
         )
-        assert status == 401
-        assert "resource_metadata=" in headers["WWW-Authenticate"]
+        assert status == 403
+        assert 'error="insufficient_scope"' in headers["WWW-Authenticate"]
+        assert 'scope="trnje:write"' in headers["WWW-Authenticate"]
+        assert "oauth-protected-resource/mcp" in headers["WWW-Authenticate"]
         assert server.queue.pending_count() == 0
+    finally:
+        server.close()
+
+
+def test_introspection_outage_returns_503(tmp_path):
+    class UnavailableAuth:
+        def verify(self, authorization, required_scope):
+            raise OAuthUnavailable("authorization server offline")
+
+    server = RunningServer(tmp_path, auth=UnavailableAuth())
+    try:
+        status, headers, body = request(server, rpc("tools/list"))
+        assert status == 503
+        assert headers["Retry-After"] == "5"
+        assert json.loads(body)["error"] == "authorization_service_unavailable"
     finally:
         server.close()
 
