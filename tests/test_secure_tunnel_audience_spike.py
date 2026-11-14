@@ -1,9 +1,8 @@
-"""Characterization tests for OpenAI Secure MCP Tunnel resource rewriting.
+"""Characterization and regression tests for Secure MCP Tunnel audience binding.
 
-These tests do not call OpenAI or an OAuth provider. They model the documented
-contract: Tunnel rewrites the connector-facing PRMD resource to an
-OpenAI-hosted /v1/mcp/{tunnel_id} URL, then forwards Authorization to the
-upstream MCP server. They capture the current TRNJE configuration limitation.
+These tests use a synthetic tunnel host with the documented endpoint shape:
+<OPENAI_MCP_TUNNEL_BASE_URL>/v1/mcp/<tunnel_id>.
+They do not call OpenAI, ChatGPT, or a real OAuth provider.
 """
 import json
 import sys
@@ -15,7 +14,6 @@ import pytest
 
 from trnje_mcp_http import (
     MCPConfig,
-    MCPConfigurationError,
     InvalidToken,
     OAuthIntrospection,
     READ_SCOPE,
@@ -23,11 +21,12 @@ from trnje_mcp_http import (
 
 
 UPSTREAM_RESOURCE = "https://trnje.example.test/mcp"
-# Synthetic host; the path mirrors the documented OpenAI tunnel endpoint.
-TUNNEL_RESOURCE = (
-    "https://tunnel.example.test/v1/mcp/"
-    "0123456789abcdef0123456789abcdef"
-)
+TUNNEL_BASE = "https://tunnel.example.test/v1/mcp/"
+TUNNEL_ID = "tunnel_0123456789abcdef0123456789abcdef"
+OTHER_TUNNEL_ID = "tunnel_0123456789abcdef0123456789abcdee"
+TUNNEL_RESOURCE = TUNNEL_BASE + TUNNEL_ID
+OTHER_TUNNEL_RESOURCE = TUNNEL_BASE + OTHER_TUNNEL_ID
+OTHER_RESOURCE = "https://other-tunnel.example.test/v1/mcp/" + TUNNEL_ID
 ISSUER = "https://auth.example.test"
 
 
@@ -77,6 +76,24 @@ def verify_with_audience(monkeypatch, configured_audience, token_audience):
     )
 
 
+def set_required_environment(monkeypatch, audience=None):
+    values = {
+        "TRNJE_MCP_HOST": "127.0.0.1",
+        "TRNJE_MCP_PORT": "8766",
+        "TRNJE_PUBLIC_BASE_URL": "https://trnje.example.test",
+        "TRNJE_OAUTH_ISSUER": ISSUER,
+        "TRNJE_OAUTH_INTROSPECTION_URL": ISSUER + "/oauth/introspect",
+        "TRNJE_OAUTH_CLIENT_ID": "trnje-resource",
+        "TRNJE_OAUTH_CLIENT_SECRET": "test-only-secret",
+    }
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+    if audience is None:
+        monkeypatch.delenv("TRNJE_OAUTH_AUDIENCE", raising=False)
+    else:
+        monkeypatch.setenv("TRNJE_OAUTH_AUDIENCE", audience)
+
+
 def test_local_resource_token_is_accepted(monkeypatch):
     result = verify_with_audience(
         monkeypatch, UPSTREAM_RESOURCE, UPSTREAM_RESOURCE
@@ -84,42 +101,49 @@ def test_local_resource_token_is_accepted(monkeypatch):
     assert result == {"scopes": [READ_SCOPE]}
 
 
-def test_tunnel_rewritten_resource_token_is_rejected_with_current_default_audience(
-    monkeypatch,
-):
-    # OpenAI Tunnel rewrites the discovered resource to its hosted endpoint.
-    # A token bound to that URL must not match TRNJE's current upstream audience.
+def test_tunnel_resource_is_rejected_when_upstream_audience_is_expected(monkeypatch):
     with pytest.raises(InvalidToken, match="audience"):
         verify_with_audience(
             monkeypatch, UPSTREAM_RESOURCE, TUNNEL_RESOURCE
         )
 
 
-def test_validator_accepts_tunnel_token_only_when_exact_tunnel_audience_is_configured(
-    monkeypatch,
-):
-    # The validator itself already supports an exact external audience. The
-    # current environment parser is the restriction exercised by the next test.
+def test_exact_configured_tunnel_resource_is_accepted(monkeypatch):
     result = verify_with_audience(
         monkeypatch, TUNNEL_RESOURCE, TUNNEL_RESOURCE
     )
     assert result == {"scopes": [READ_SCOPE]}
 
 
-def test_environment_parser_rejects_tunnel_rewritten_resource_audience(monkeypatch):
-    monkeypatch.setenv("TRNJE_MCP_HOST", "127.0.0.1")
-    monkeypatch.setenv("TRNJE_MCP_PORT", "8766")
-    monkeypatch.setenv("TRNJE_PUBLIC_BASE_URL", "https://trnje.example.test")
-    monkeypatch.setenv("TRNJE_OAUTH_ISSUER", ISSUER)
-    monkeypatch.setenv(
-        "TRNJE_OAUTH_INTROSPECTION_URL", ISSUER + "/oauth/introspect"
-    )
-    monkeypatch.setenv("TRNJE_OAUTH_CLIENT_ID", "trnje-resource")
-    monkeypatch.setenv("TRNJE_OAUTH_CLIENT_SECRET", "test-only-secret")
-    monkeypatch.setenv("TRNJE_OAUTH_AUDIENCE", TUNNEL_RESOURCE)
+@pytest.mark.parametrize(
+    "unexpected_audience",
+    [OTHER_TUNNEL_RESOURCE, OTHER_RESOURCE],
+    ids=["different-tunnel-id", "different-resource-host"],
+)
+def test_tunnel_token_rejects_wrong_tunnel_id_or_resource(
+    monkeypatch, unexpected_audience
+):
+    with pytest.raises(InvalidToken, match="audience"):
+        verify_with_audience(
+            monkeypatch, TUNNEL_RESOURCE, unexpected_audience
+        )
 
-    with pytest.raises(
-        MCPConfigurationError,
-        match="must exactly match TRNJE_PUBLIC_BASE_URL",
-    ):
-        MCPConfig.from_env()
+
+def test_environment_parser_accepts_separate_tunnel_audience(monkeypatch):
+    set_required_environment(monkeypatch, TUNNEL_RESOURCE)
+
+    config = MCPConfig.from_env()
+
+    # Public resource metadata continues to describe the upstream MCP server.
+    assert config.resource_url == UPSTREAM_RESOURCE
+    # Authorization is bound to the exact connector-facing tunnel resource.
+    assert config.audience == TUNNEL_RESOURCE
+
+
+def test_environment_parser_keeps_direct_resource_as_default(monkeypatch):
+    set_required_environment(monkeypatch)
+
+    config = MCPConfig.from_env()
+
+    assert config.resource_url == UPSTREAM_RESOURCE
+    assert config.audience == UPSTREAM_RESOURCE
