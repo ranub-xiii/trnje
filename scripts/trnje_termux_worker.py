@@ -396,8 +396,13 @@ def execute(r: Path, kind: str, p: dict) -> dict:
                 if x["exit"] != expected_exit:
                     raise ValueError("TaskReport status and CLI exit code disagree")
                 x["status"] = report_status
-                x["detail"] = clean(str(report.get("detail", "")))[:400]
-                x["task_report"] = report
+                # Sanitize the complete structured report before it reaches
+                # SQLite, the MCP response, or the durable evidence log.
+                safe_report = json.loads(
+                    clean(json.dumps(report, ensure_ascii=False))
+                )
+                x["detail"] = clean(str(safe_report.get("detail", "")))[:400]
+                x["task_report"] = safe_report
             except (ValueError, TypeError):
                 x["status"] = "UNKNOWN"
                 x["detail"] = "Runner exited but its structured TaskReport could not be verified."
@@ -981,13 +986,9 @@ def main() -> int:
         )
         next_poll = time.monotonic()
         while True:
-            if mcp_queue is not None:
-                # Clear before claiming: an enqueue during the claim or execution
-                # leaves the event set and causes the next pass to run immediately.
-                wake.clear()
-                if process_mcp_queue(mcp_queue, r):
-                    continue
-
+            # Respect the mailbox poll deadline before starting another queued
+            # MCP task, so a steady stream of direct submissions cannot starve
+            # GitHub/Dropbox polling between task executions.
             now = time.monotonic()
             if now >= next_poll:
                 try:
@@ -1010,6 +1011,13 @@ def main() -> int:
                     print(f"BLOCKED: GitHub/Dropbox poll: {clean(str(exc))[:200]}", file=sys.stderr, flush=True)
                 next_poll = time.monotonic() + a.poll_seconds
                 continue
+
+            if mcp_queue is not None:
+                # Clear before claiming: an enqueue during the claim or execution
+                # leaves the event set and causes the next pass to run immediately.
+                wake.clear()
+                if process_mcp_queue(mcp_queue, r):
+                    continue
 
             wait_seconds = max(0.0, next_poll - time.monotonic())
             if mcp_queue is None:

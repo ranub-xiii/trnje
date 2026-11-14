@@ -1,4 +1,5 @@
 import importlib.util
+import ast
 import sys
 from pathlib import Path
 
@@ -371,6 +372,61 @@ class TrnjeTermuxWorkerTests(unittest.TestCase):
                 )
             self.assertEqual(result["status"], "UNKNOWN")
             self.assertIn("could not be verified", result["detail"])
+
+    def test_run_task_report_redacts_sensitive_fields_before_exposure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "scripts").mkdir()
+            (root / "scripts" / "run_task.py").write_text("# test runner\n", encoding="utf-8")
+            (root / "sample.py").write_text("value = 1\n", encoding="utf-8")
+            report = {
+                "status": "BLOCKED",
+                "phase": "model",
+                "detail": "inference failed",
+                "model": {"error": "access_token=secret-value-123"},
+            }
+            stdout = json.dumps(report) + "\n"
+            outcomes = [
+                {"status": "FAIL", "exit": 1, "output": stdout,
+                 "stdout": stdout, "stderr": "", "detail": "exit 1"},
+                {"status": "PASS", "exit": 0, "output": "", "stdout": "", "stderr": "", "detail": ""},
+                {"status": "PASS", "exit": 0, "output": "", "stdout": "", "stderr": "", "detail": ""},
+            ]
+            with patch.object(WORKER, "call", side_effect=outcomes):
+                result = WORKER.execute(
+                    root, "run_task",
+                    {"file": "sample.py", "task": "change value", "expect": "value = 2"},
+                )
+            serialized = json.dumps(result["task_report"])
+            self.assertNotIn("secret-value-123", serialized)
+            self.assertIn("[REDACTED]", serialized)
+
+    def test_worker_polls_mailbox_before_claiming_next_mcp_task(self):
+        tree = ast.parse(WORKER_PATH.read_text(encoding="utf-8"))
+        main = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "main"
+        )
+        loop = next(
+            node for node in main.body
+            if isinstance(node, ast.While) and isinstance(node.test, ast.Constant)
+            and node.test.value is True
+        )
+        poll_line = next(
+            node.lineno for node in loop.body
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "now"
+        )
+        queue_line = next(
+            node.lineno for node in loop.body
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "mcp_queue"
+        )
+        self.assertLess(poll_line, queue_line)
 
     def test_installer_sha256_pins_match_all_worker_modules(self):
         import hashlib
