@@ -291,8 +291,8 @@ def _decode_mcp_name(value: str | None) -> str | None:
             return base64.b64decode(encoded, validate=True).decode("utf-8")
         except (ValueError, UnicodeDecodeError):
             return None
-    if value != value.strip(" \\t") or any(
-        (ord(char) < 0x20 and char != "\\t") or ord(char) > 0x7E
+    if value != value.strip(" \t") or any(
+        (ord(char) < 0x20 and char != "\t") or ord(char) > 0x7E
         for char in value
     ):
         return None
@@ -303,7 +303,7 @@ def _valid_mcp_method_header(value: str | None) -> bool:
     return bool(
         isinstance(value, str)
         and value
-        and value == value.strip(" \\t")
+        and value == value.strip(" \t")
         and all(0x21 <= ord(char) <= 0x7E for char in value)
     )
 
