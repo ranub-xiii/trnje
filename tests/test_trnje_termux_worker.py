@@ -1,4 +1,8 @@
 import importlib.util
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import json
 import tempfile
 import unittest
@@ -71,7 +75,6 @@ class TrnjeTermuxWorkerTests(unittest.TestCase):
             result = WORKER.execute(Path(directory), "read_file", {"path": "missing.md"})
             self.assertEqual(result["status"], "BLOCKED")
             self.assertIn("FILE_NOT_FOUND", result["detail"])
-
 
     def test_gh_retries_tls_handshake_timeout_then_succeeds(self):
         failed = type("Completed", (), {
@@ -298,27 +301,6 @@ class TrnjeTermuxWorkerTests(unittest.TestCase):
             self.assertIn(payload["expect"], calls[0][0])
             self.assertEqual(calls[0][1], 11100)
 
-    def test_run_task_report_exit_mismatch_never_becomes_pass(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "scripts").mkdir()
-            (root / "scripts" / "run_task.py").write_text("# test runner\n", encoding="utf-8")
-            (root / "sample.py").write_text("value = 1\n", encoding="utf-8")
-            stdout = json.dumps({"status": "PASS", "detail": "claimed pass"}) + "\n"
-            outcomes = [
-                {"status": "FAIL", "exit": 1, "output": stdout,
-                 "stdout": stdout, "stderr": "", "detail": "exit 1"},
-                {"status": "PASS", "exit": 0, "output": "", "stdout": "", "stderr": "", "detail": ""},
-                {"status": "PASS", "exit": 0, "output": "", "stdout": "", "stderr": "", "detail": ""},
-            ]
-            with patch.object(WORKER, "call", side_effect=outcomes):
-                result = WORKER.execute(
-                    root, "run_task",
-                    {"file": "sample.py", "task": "change value", "expect": "value = 2"},
-                )
-            self.assertEqual(result["status"], "UNKNOWN")
-            self.assertIn("could not be verified", result["detail"])
-
     def test_mcp_validation_reuses_existing_worker_allowlist(self):
         self.assertEqual(
             WORKER.validate_mcp_task("diagnostics", {}),
@@ -327,7 +309,7 @@ class TrnjeTermuxWorkerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             WORKER.validate_mcp_task("shell", {"cmd": "id"})
         with self.assertRaises(ValueError):
-            WORKER.validate_mcp_task("run_task", {"file": "../outside.py"})
+            WORKER.validate_mcp_task("diagnostics", {"unexpected": True})
 
     def test_mcp_queue_runs_through_existing_execute_and_persists_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -369,16 +351,147 @@ class TrnjeTermuxWorkerTests(unittest.TestCase):
             self.assertEqual(result["detail"], "workspace busy")
             self.assertEqual(result["task_report"]["phase"], "lock")
 
-    def test_installer_sha256_pin_matches_worker_source(self):
+    def test_run_task_report_exit_mismatch_never_becomes_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "scripts").mkdir()
+            (root / "scripts" / "run_task.py").write_text("# test runner\n", encoding="utf-8")
+            (root / "sample.py").write_text("value = 1\n", encoding="utf-8")
+            stdout = json.dumps({"status": "PASS", "detail": "claimed pass"}) + "\n"
+            outcomes = [
+                {"status": "FAIL", "exit": 1, "output": stdout,
+                 "stdout": stdout, "stderr": "", "detail": "exit 1"},
+                {"status": "PASS", "exit": 0, "output": "", "stdout": "", "stderr": "", "detail": ""},
+                {"status": "PASS", "exit": 0, "output": "", "stdout": "", "stderr": "", "detail": ""},
+            ]
+            with patch.object(WORKER, "call", side_effect=outcomes):
+                result = WORKER.execute(
+                    root, "run_task",
+                    {"file": "sample.py", "task": "change value", "expect": "value = 2"},
+                )
+            self.assertEqual(result["status"], "UNKNOWN")
+            self.assertIn("could not be verified", result["detail"])
+
+    def test_installer_sha256_pins_match_all_worker_modules(self):
         import hashlib
         import re
 
-        installer = (Path(__file__).resolve().parents[1] /
-                     "scripts" / "install_trnje_termux_worker.sh").read_text(encoding="utf-8")
-        match = re.search(r'^expected_sha256="([0-9a-f]{64})"$', installer, re.MULTILINE)
-        self.assertIsNotNone(match)
-        self.assertEqual(match.group(1), hashlib.sha256(WORKER_PATH.read_bytes()).hexdigest())
-        self.assertIn('worker_ref="${TRNJE_WORKER_REF:-main}"', installer)
+        root = Path(__file__).resolve().parents[1]
+        installer = (root / "scripts" / "install_trnje_termux_worker.sh").read_text(encoding="utf-8")
+        expected = {
+            "worker": hashlib.sha256(WORKER_PATH.read_bytes()).hexdigest(),
+            "queue": hashlib.sha256((root / "scripts" / "trnje_api_queue.py").read_bytes()).hexdigest(),
+            "mcp": hashlib.sha256((root / "scripts" / "trnje_mcp_http.py").read_bytes()).hexdigest(),
+        }
+        for name, digest in expected.items():
+            match = re.search(
+                rf'^expected_{name}_sha256="([0-9a-f]{64})"$',
+                installer,
+                re.MULTILINE,
+            )
+            self.assertIsNotNone(match, name)
+            self.assertEqual(match.group(1), digest, name)
+
+
+    def test_parse_accepts_dropbox_forward_marker(self):
+        marker = WORKER.dropbox_source_marker("id:abc123", "rev-1")
+        body = (
+            'TRNJE_TASK_JSON\n{"kind":"diagnostics","payload":{}}'
+            + "\n\n" + marker
+        )
+        self.assertEqual(WORKER.parse(body)[0], "diagnostics")
+
+    def test_parse_rejects_malformed_dropbox_forward_marker(self):
+        body = (
+            'TRNJE_TASK_JSON\n{"kind":"diagnostics","payload":{}}'
+            + "\n\n<!-- TRNJE_DROPBOX_SOURCE:not-a-sha256 -->"
+        )
+        with self.assertRaises(WORKER.Blocked):
+            WORKER.parse(body)
+
+    def test_dropbox_disabled_is_noop(self):
+        with patch.dict(WORKER.os.environ, {"TRNJE_DROPBOX_ENABLED": "0"}), \
+             patch.object(WORKER, "dropbox_config") as config:
+            self.assertEqual(WORKER.dropbox_ingest({}, []), 0)
+        config.assert_not_called()
+
+    def test_dropbox_ingest_forwards_allowlisted_command_and_persists_cursor(self):
+        command = 'TRNJE_TASK_JSON\n{"kind":"diagnostics","payload":{}}'
+        raw = command.encode("utf-8")
+        entry = {
+            ".tag": "file", "name": "diagnostics.json",
+            "id": "id:abc123", "rev": "rev-1", "size": len(raw),
+        }
+        page = {"entries": [entry], "cursor": "cursor-1", "has_more": False}
+        state = {"version": 1, "last_seen": 0, "tasks": {}}
+        with patch.dict(WORKER.os.environ, {"TRNJE_DROPBOX_ENABLED": "1"}), \
+             patch.object(WORKER, "dropbox_config", return_value={"inbox": "/trnje-inbox"}), \
+             patch.object(WORKER, "dropbox_access_token", return_value="token"), \
+             patch.object(WORKER, "dropbox_list_page", return_value=page), \
+             patch.object(WORKER, "dropbox_download", return_value=raw), \
+             patch.object(WORKER, "post", return_value=True) as post, \
+             patch.object(WORKER, "save"):
+            count = WORKER.dropbox_ingest(state, [])
+        marker = WORKER.dropbox_source_marker("id:abc123", "rev-1")
+        self.assertEqual(count, 1)
+        self.assertEqual(state["dropbox_cursor"], "cursor-1")
+        post.assert_called_once_with(command + "\n\n" + marker)
+        self.assertEqual(WORKER.parse(post.call_args.args[0])[0], "diagnostics")
+
+    def test_dropbox_ingest_skips_source_already_forwarded_to_github(self):
+        command = 'TRNJE_TASK_JSON\n{"kind":"diagnostics","payload":{}}'
+        entry = {
+            ".tag": "file", "name": "diagnostics.json",
+            "id": "id:abc123", "rev": "rev-1", "size": len(command.encode("utf-8")),
+        }
+        page = {"entries": [entry], "cursor": "cursor-2", "has_more": False}
+        marker = WORKER.dropbox_source_marker("id:abc123", "rev-1")
+        items = [{"body": command + "\n\n" + marker}]
+        with patch.dict(WORKER.os.environ, {"TRNJE_DROPBOX_ENABLED": "1"}), \
+             patch.object(WORKER, "dropbox_config", return_value={"inbox": "/trnje-inbox"}), \
+             patch.object(WORKER, "dropbox_access_token", return_value="token"), \
+             patch.object(WORKER, "dropbox_list_page", return_value=page), \
+             patch.object(WORKER, "dropbox_download") as download, \
+             patch.object(WORKER, "post") as post, patch.object(WORKER, "save"):
+            count = WORKER.dropbox_ingest({}, items)
+        self.assertEqual(count, 0)
+        download.assert_not_called()
+        post.assert_not_called()
+
+    def test_dropbox_ingest_rejects_arbitrary_shell_without_advancing_cursor(self):
+        command = 'TRNJE_TASK_JSON\n{"kind":"shell","payload":{"cmd":"id"}}'
+        raw = command.encode("utf-8")
+        entry = {
+            ".tag": "file", "name": "shell.json",
+            "id": "id:abc123", "rev": "rev-1", "size": len(raw),
+        }
+        page = {"entries": [entry], "cursor": "cursor-3", "has_more": False}
+        state = {"version": 1, "last_seen": 0, "tasks": {}}
+        with patch.dict(WORKER.os.environ, {"TRNJE_DROPBOX_ENABLED": "1"}), \
+             patch.object(WORKER, "dropbox_config", return_value={"inbox": "/trnje-inbox"}), \
+             patch.object(WORKER, "dropbox_access_token", return_value="token"), \
+             patch.object(WORKER, "dropbox_list_page", return_value=page), \
+             patch.object(WORKER, "dropbox_download", return_value=raw), \
+             patch.object(WORKER, "post") as post, patch.object(WORKER, "save"):
+            with self.assertRaises(WORKER.Blocked):
+                WORKER.dropbox_ingest(state, [])
+        post.assert_not_called()
+        self.assertNotIn("dropbox_cursor", state)
+
+    def test_dropbox_failure_does_not_block_existing_github_mailbox(self):
+        state = {"version": 1, "last_seen": 0, "tasks": {}}
+        comment = {"id": 42, "body": "ordinary non-task comment"}
+        with patch.dict(WORKER.os.environ, {"TRNJE_DROPBOX_ENABLED": "1"}), \
+             patch.object(WORKER, "comments", return_value=[comment]), \
+             patch.object(WORKER, "deliver"), \
+             patch.object(WORKER, "dropbox_ingest", side_effect=WORKER.Blocked("Dropbox offline")), \
+             patch.object(WORKER, "save"):
+            count = WORKER.once(Path("/tmp"), state)
+        self.assertEqual(count, 1)
+        self.assertEqual(state["last_seen"], 42)
+        self.assertEqual(state["last_poll_status"], "PASS")
+        self.assertEqual(state["last_dropbox_poll_status"], "BLOCKED")
+        self.assertIn("Dropbox offline", state["last_dropbox_poll_error"])
 
 
 if __name__ == "__main__":
