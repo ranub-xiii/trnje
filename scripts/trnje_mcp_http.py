@@ -133,6 +133,14 @@ class MCPConfig:
         )
         if not hosts:
             hosts = ("127.0.0.1", "localhost", public_host or "")
+        host_pattern = (
+            r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+            r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*"
+        )
+        if any(not re.fullmatch(host_pattern, item) for item in hosts):
+            raise MCPConfigurationError(
+                "Allowed hosts must be exact DNS names or IPv4 addresses; wildcards and ports are not allowed."
+            )
         return cls(
             host=host,
             port=port,
@@ -184,9 +192,13 @@ class OAuthIntrospection:
         ):
             raise OAuthError("Bearer token format is invalid.")
 
+        # RFC 6749 §2.3.1 requires form-encoding each client credential
+        # before applying HTTP Basic authentication.
         credentials = (
-            self.config.client_id + ":" + self.config.client_secret
-        ).encode("utf-8")
+            urllib.parse.quote_plus(self.config.client_id, safe="")
+            + ":"
+            + urllib.parse.quote_plus(self.config.client_secret, safe="")
+        ).encode("ascii")
         body = urllib.parse.urlencode({
             "token": token,
             "token_type_hint": "access_token",
@@ -289,7 +301,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "required": ["kind", "payload", "idempotency_key"],
                 "additionalProperties": False,
             },
-            "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+            "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
         },
         {
             "name": "trnje_get_task",

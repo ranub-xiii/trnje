@@ -329,6 +329,21 @@ def test_oauth_config_requires_https_and_real_issuer(tmp_path, monkeypatch):
         MCPConfig.from_env()
 
 
+def test_oauth_allowed_hosts_reject_wildcards(monkeypatch):
+    values = {
+        "TRNJE_PUBLIC_BASE_URL": "https://trnje.example",
+        "TRNJE_OAUTH_ISSUER": "https://auth.example",
+        "TRNJE_OAUTH_INTROSPECTION_URL": "https://auth.example/introspect",
+        "TRNJE_OAUTH_CLIENT_ID": "client",
+        "TRNJE_OAUTH_CLIENT_SECRET": "secret",
+        "TRNJE_MCP_ALLOWED_HOSTS": "trnje.example,*",
+    }
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+    with pytest.raises(MCPConfigurationError):
+        MCPConfig.from_env()
+
+
 def test_oauth_audience_must_match_the_advertised_mcp_resource(monkeypatch):
     values = {
         "TRNJE_PUBLIC_BASE_URL": "https://trnje.example",
@@ -388,6 +403,7 @@ def test_oauth_introspection_checks_active_audience_issuer_and_scope():
     assert verified["scopes"] == ["trnje:read", "trnje:write"]
     request_object = call.call_args.args[0]
     assert request_object.get_method() == "POST"
+    assert request_object.headers["Authorization"] == "Basic Y2xpZW50OnNlY3JldA=="
     assert "token=opaque-token" in request_object.data.decode("ascii")
 
 
