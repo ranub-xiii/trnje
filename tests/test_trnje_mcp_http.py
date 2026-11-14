@@ -177,6 +177,8 @@ def test_server_discover_reports_modern_protocol(running_server):
     result = json.loads(body)["result"]
     assert status == 200
     assert result["resultType"] == "complete"
+    assert result["ttlMs"] == 0
+    assert result["cacheScope"] == "private"
     assert result["supportedVersions"] == [MODERN_PROTOCOL_VERSION]
     assert result["capabilities"] == {"tools": {}}
     assert result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"] == "trnje"
@@ -207,6 +209,21 @@ def test_modern_tool_call_requires_matching_name_header(running_server):
     assert status == 400
     assert json.loads(body)["error"]["code"] == -32020
     assert running_server.wake_count == 0
+
+
+@pytest.mark.parametrize("capabilities", [None, [], "invalid"])
+def test_modern_request_requires_object_client_capabilities(running_server, capabilities):
+    message = rpc("tools/list")
+    meta = message["params"]["_meta"]
+    if capabilities is None:
+        meta.pop("io.modelcontextprotocol/clientCapabilities")
+    else:
+        meta["io.modelcontextprotocol/clientCapabilities"] = capabilities
+    status, _, body = request(running_server, message)
+    assert status == 400
+    error = json.loads(body)["error"]
+    assert error["code"] == -32600
+    assert "clientCapabilities" in error["message"]
 
 
 def test_modern_protocol_header_must_match_request_metadata(running_server):
@@ -243,12 +260,66 @@ def test_initialize_and_tools_list_follow_json_rpc(running_server):
     assert initialized["result"]["serverInfo"]["name"] == "trnje"
 
     status, _, body = request(running_server, rpc("tools/list"))
-    tools = json.loads(body)["result"]["tools"]
+    tools_message = json.loads(body)
+    tools = tools_message["result"]["tools"]
     names = {tool["name"] for tool in tools}
     assert status == 200
     assert names == {
         "trnje_health", "trnje_submit_task", "trnje_get_task", "trnje_list_tasks"
     }
+    assert tools_message["result"]["resultType"] == "complete"
+    assert tools_message["result"]["ttlMs"] == 0
+    assert tools_message["result"]["cacheScope"] == "private"
+
+
+def test_modern_tool_call_includes_result_type(running_server):
+    status, _, body = request(running_server, tool_call("trnje_health", {}))
+    message = json.loads(body)
+    assert status == 200
+    assert message["result"]["resultType"] == "complete"
+    assert decode_tool(body)["service"] == "trnje-mcp"
+
+
+def test_python_sdk_v2_streamable_http_interoperates(running_server):
+    import asyncio
+    import httpx2
+    from mcp import Client
+    from mcp.client.streamable_http import streamable_http_client
+
+    async def exercise():
+        async with httpx2.AsyncClient(
+            headers={"Authorization": "Bearer test-access-token"},
+            timeout=httpx2.Timeout(30.0, read=300.0),
+        ) as http_client:
+            transport = streamable_http_client(
+                running_server.url,
+                http_client=http_client,
+                terminate_on_close=False,
+            )
+            async with Client(transport) as client:
+                assert client.protocol_version == MODERN_PROTOCOL_VERSION
+                tools = await client.list_tools()
+                names = {tool.name for tool in tools.tools}
+                assert names == {
+                    "trnje_health", "trnje_submit_task",
+                    "trnje_get_task", "trnje_list_tasks",
+                }
+                health = await client.call_tool("trnje_health", {})
+                assert health.is_error is False
+                health_value = json.loads(health.content[0].text)
+                assert health_value["service"] == "trnje-mcp"
+
+                submitted = await client.call_tool("trnje_submit_task", {
+                    "kind": "diagnostics",
+                    "payload": {},
+                    "idempotency_key": "python-sdk-interop",
+                })
+                assert submitted.is_error is False
+                submission = json.loads(submitted.content[0].text)
+                assert submission["status"] == "QUEUED"
+                assert running_server.queue.get(submission["task_id"])["status"] == "QUEUED"
+
+    asyncio.run(exercise())
 
 
 def test_modern_tool_call_requires_name_header(running_server):
@@ -267,7 +338,21 @@ def test_legacy_tools_list_remains_available(running_server):
         header_overrides={"MCP-Protocol-Version": "2025-11-25"},
     )
     assert status == 200
-    assert json.loads(body)["result"]["tools"]
+    legacy_result = json.loads(body)["result"]
+    assert legacy_result["tools"]
+    assert not ({"resultType", "ttlMs", "cacheScope"} & set(legacy_result))
+
+
+def test_legacy_ping_remains_available(running_server):
+    status, _, body = request(running_server, rpc("ping", modern=False))
+    assert status == 200
+    assert json.loads(body)["result"] == {}
+
+
+def test_modern_ping_is_not_available(running_server):
+    status, _, body = request(running_server, rpc("ping"))
+    assert status == 404
+    assert json.loads(body)["error"]["code"] == -32601
 
 
 def test_submit_is_durable_and_returns_without_running(running_server):

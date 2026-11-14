@@ -538,6 +538,15 @@ def create_server(
                 )
                 return False
 
+            client_capabilities = meta.get("io.modelcontextprotocol/clientCapabilities")
+            if not isinstance(client_capabilities, dict):
+                self._rpc_error(
+                    request_id, -32600,
+                    "Modern requests require clientCapabilities in params._meta.",
+                    status=400,
+                )
+                return False
+
             method_header = self.headers.get("Mcp-Method")
             if not _valid_mcp_method_header(method_header) or method_header != method:
                 self._rpc_error(
@@ -671,6 +680,8 @@ def create_server(
                     "id": request_id,
                     "result": {
                         "resultType": "complete",
+                        "ttlMs": 0,
+                        "cacheScope": "private",
                         "supportedVersions": [MODERN_PROTOCOL_VERSION],
                         "capabilities": {"tools": {}},
                         "_meta": {
@@ -707,13 +718,20 @@ def create_server(
                     },
                 })
                 return
-            if method == "ping":
+            if method == "ping" and modern is not True:
                 self._send(200, {"jsonrpc": "2.0", "id": request_id, "result": {}})
                 return
             if method == "tools/list":
+                list_result = {"tools": _tool_definitions()}
+                if modern is True:
+                    list_result.update({
+                        "resultType": "complete",
+                        "ttlMs": 0,
+                        "cacheScope": "private",
+                    })
                 self._send(200, {
                     "jsonrpc": "2.0", "id": request_id,
-                    "result": {"tools": _tool_definitions()},
+                    "result": list_result,
                 })
                 return
             if method == "tools/call":
@@ -725,16 +743,19 @@ def create_server(
                 except Exception:
                     self._rpc_error(request_id, -32603, "Internal error")
                     return
+                call_result = {
+                    "content": [{
+                        "type": "text",
+                        "text": json.dumps(result, ensure_ascii=False, sort_keys=True),
+                    }],
+                    "isError": is_error,
+                }
+                if modern is True:
+                    call_result["resultType"] = "complete"
                 self._send(200, {
                     "jsonrpc": "2.0",
                     "id": request_id,
-                    "result": {
-                        "content": [{
-                            "type": "text",
-                            "text": json.dumps(result, ensure_ascii=False, sort_keys=True),
-                        }],
-                        "isError": is_error,
-                    },
+                    "result": call_result,
                 })
                 return
             if modern is True:
