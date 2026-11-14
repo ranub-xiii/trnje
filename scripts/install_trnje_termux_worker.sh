@@ -91,7 +91,7 @@ fetch_python_file "scripts/trnje_termux_worker.py" "$worker_tmp"
 fetch_python_file "scripts/trnje_api_queue.py" "$queue_tmp"
 fetch_python_file "scripts/trnje_mcp_http.py" "$mcp_tmp"
 
-expected_worker_sha256="e54b571e2a4b0fd9c5ff8eca563e0f59fc62f49a74d80d123d6f5d5d37fdd28f"
+expected_worker_sha256="a409c016bb89cffdd97034bdda9a688ddf2a022044c49a1d1a92b4f757cca47a"
 expected_queue_sha256="c3ff841837686b61b5638ae118c9d5cab815a9b542c437a474ee8da97b6582de"
 expected_mcp_sha256="47a9640e335caf0df6fa41c6bbdf5312743f16632a8227d2a8ed7ba0ed0d7936"
 actual_worker_sha256="$(python -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$worker_tmp")"

@@ -383,7 +383,10 @@ class TrnjeTermuxWorkerTests(unittest.TestCase):
                 "status": "BLOCKED",
                 "phase": "model",
                 "detail": "inference failed",
-                "model": {"error": "access_token=secret-value-123"},
+                "model": {
+                    "error": "access_token=secret-value-123",
+                    "access_token": "second-secret-value",
+                },
             }
             stdout = json.dumps(report) + "\n"
             outcomes = [
@@ -399,6 +402,8 @@ class TrnjeTermuxWorkerTests(unittest.TestCase):
                 )
             serialized = json.dumps(result["task_report"])
             self.assertNotIn("secret-value-123", serialized)
+            self.assertNotIn("second-secret-value", serialized)
+            self.assertEqual(result["task_report"]["model"]["access_token"], "[REDACTED]")
             self.assertIn("[REDACTED]", serialized)
 
     def test_worker_polls_mailbox_before_claiming_next_mcp_task(self):
@@ -408,7 +413,7 @@ class TrnjeTermuxWorkerTests(unittest.TestCase):
             if isinstance(node, ast.FunctionDef) and node.name == "main"
         )
         loop = next(
-            node for node in main.body
+            node for node in ast.walk(main)
             if isinstance(node, ast.While) and isinstance(node.test, ast.Constant)
             and node.test.value is True
         )

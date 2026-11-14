@@ -51,7 +51,7 @@ _DROPBOX_ACCESS_TOKEN_EXPIRES = 0.0
 REDACT = [
     re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"),
     re.compile(r"\bsl\.[A-Za-z0-9_-]{20,}\b"),
-    re.compile(r"(?i)\b(authorization|access[_ -]?token|refresh[_ -]?token|password|client[_ -]?secret|api[_ -]?key|secret[_ -]?key)\s*[:=]\s*[^\s,;]+"),
+    re.compile(r"(?i)\b(authorization|access[_ -]?token|refresh[_ -]?token|password|client[_ -]?secret|api[_ -]?key|secret[_ -]?key)\s*[:=]\s*[^\s,;\"']+"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
 ]
 DENIED = {".git", ".ssh", ".config", ".env", "credentials", "credential", "secrets", "secret", "token", "tokens"}
@@ -65,6 +65,29 @@ def clean(s: str) -> str:
     for pattern in REDACT:
         s = pattern.sub("[REDACTED]", s)
     return s[:MAX_TEXT]
+
+
+def redact_structure(value):
+    """Redact secret-bearing fields recursively before persistence or API output."""
+    sensitive_names = {
+        "authorization", "token", "accesstoken", "refreshtoken",
+        "password", "clientsecret", "apikey", "secretkey", "secret",
+        "credential", "credentials",
+    }
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+            redacted[key] = (
+                "[REDACTED]" if normalized in sensitive_names
+                else redact_structure(item)
+            )
+        return redacted
+    if isinstance(value, list):
+        return [redact_structure(item) for item in value]
+    if isinstance(value, str):
+        return clean(value)
+    return value
 
 
 def env() -> dict[str, str]:
@@ -398,9 +421,7 @@ def execute(r: Path, kind: str, p: dict) -> dict:
                 x["status"] = report_status
                 # Sanitize the complete structured report before it reaches
                 # SQLite, the MCP response, or the durable evidence log.
-                safe_report = json.loads(
-                    clean(json.dumps(report, ensure_ascii=False))
-                )
+                safe_report = redact_structure(report)
                 x["detail"] = clean(str(safe_report.get("detail", "")))[:400]
                 x["task_report"] = safe_report
             except (ValueError, TypeError):
