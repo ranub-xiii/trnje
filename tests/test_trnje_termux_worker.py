@@ -384,11 +384,8 @@ class TrnjeTermuxWorkerTests(unittest.TestCase):
             "mcp": hashlib.sha256((root / "scripts" / "trnje_mcp_http.py").read_bytes()).hexdigest(),
         }
         for name, digest in expected.items():
-            match = re.search(
-                rf'^expected_{name}_sha256="([0-9a-f]{{64}})",
-                installer,
-                re.MULTILINE,
-            )
+            pattern = r'^expected_' + re.escape(name) + r'_sha256="([0-9a-f]{64})"$'
+            match = re.search(pattern, installer, re.MULTILINE)
             self.assertIsNotNone(match, name)
             self.assertEqual(match.group(1), digest, name)
 
