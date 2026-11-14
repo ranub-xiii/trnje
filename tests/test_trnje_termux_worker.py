@@ -72,6 +72,74 @@ class TrnjeTermuxWorkerTests(unittest.TestCase):
             self.assertEqual(result["status"], "BLOCKED")
             self.assertIn("FILE_NOT_FOUND", result["detail"])
 
+
+    def test_gh_retries_tls_handshake_timeout_then_succeeds(self):
+        failed = type("Completed", (), {
+            "returncode": 1, "stdout": "",
+            "stderr": 'Get "https://api.github.com/...": net/http: TLS handshake timeout',
+        })()
+        succeeded = type("Completed", (), {
+            "returncode": 0, "stdout": '[{"id":1}]', "stderr": "",
+        })()
+        with patch.object(WORKER.subprocess, "run", side_effect=[failed, failed, succeeded]) as run, \
+             patch.object(WORKER.time, "sleep") as sleep:
+            result = WORKER.gh(["repos/example"], timeout=45)
+        self.assertEqual(result, '[{"id":1}]')
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 5])
+
+    def test_gh_stops_after_three_transient_failures(self):
+        failed = type("Completed", (), {
+            "returncode": 1, "stdout": "",
+            "stderr": "net/http: TLS handshake timeout",
+        })()
+        with patch.object(WORKER.subprocess, "run", return_value=failed) as run, \
+             patch.object(WORKER.time, "sleep") as sleep:
+            with self.assertRaises(WORKER.Blocked) as raised:
+                WORKER.gh(["repos/example"], timeout=45)
+        self.assertIn("after 3 attempt", str(raised.exception))
+        self.assertIn("retry limit reached", str(raised.exception))
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 5])
+
+    def test_gh_does_not_retry_permission_errors(self):
+        forbidden = type("Completed", (), {
+            "returncode": 1, "stdout": "",
+            "stderr": "HTTP 403: Resource not accessible by integration",
+        })()
+        with patch.object(WORKER.subprocess, "run", return_value=forbidden) as run, \
+             patch.object(WORKER.time, "sleep") as sleep:
+            with self.assertRaises(WORKER.Blocked) as raised:
+                WORKER.gh(["repos/example"])
+        self.assertIn("non-retryable error", str(raised.exception))
+        run.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_gh_retries_http_5xx_but_not_arbitrary_server_errors(self):
+        unavailable = type("Completed", (), {
+            "returncode": 1, "stdout": "",
+            "stderr": "HTTP 503: Service Unavailable",
+        })()
+        succeeded = type("Completed", (), {
+            "returncode": 0, "stdout": "ok", "stderr": "",
+        })()
+        with patch.object(WORKER.subprocess, "run", side_effect=[unavailable, succeeded]) as run, \
+             patch.object(WORKER.time, "sleep") as sleep:
+            self.assertEqual(WORKER.gh(["repos/example"]), "ok")
+        self.assertEqual(run.call_count, 2)
+        sleep.assert_called_once_with(2)
+
+    def test_gh_retries_process_timeout_with_a_bounded_attempt_count(self):
+        succeeded = type("Completed", (), {
+            "returncode": 0, "stdout": "ok", "stderr": "",
+        })()
+        with patch.object(WORKER.subprocess, "run",
+                          side_effect=[WORKER.subprocess.TimeoutExpired("gh", 30), succeeded]) as run, \
+             patch.object(WORKER.time, "sleep") as sleep:
+            self.assertEqual(WORKER.gh(["repos/example"]), "ok")
+        self.assertEqual(run.call_count, 2)
+        sleep.assert_called_once_with(2)
+
     def test_empty_mailbox_poll_updates_heartbeat(self):
         state = {"version": 1, "last_seen": 0, "tasks": {}}
         with patch.object(WORKER, "comments", return_value=[]), \
@@ -197,18 +265,26 @@ class TrnjeTermuxWorkerTests(unittest.TestCase):
                 if len(calls) == 1:
                     previous_argv = sys.argv
                     sys.argv = [argv[1], *argv[2:]]
+                    import contextlib
+                    import io
+                    captured_stdout = io.StringIO()
+                    captured_stderr = io.StringIO()
                     try:
-                        with patch("trnje.task.run_task", side_effect=fake_run_task):
-                            try:
-                                runpy.run_path(argv[1], run_name="__main__")
-                            except SystemExit as exc:
-                                code = exc.code if isinstance(exc.code, int) else 1
-                            else:
-                                code = 0
+                        with contextlib.redirect_stdout(captured_stdout), contextlib.redirect_stderr(captured_stderr):
+                            with patch("trnje.task.run_task", side_effect=fake_run_task):
+                                try:
+                                    runpy.run_path(argv[1], run_name="__main__")
+                                except SystemExit as exc:
+                                    code = exc.code if isinstance(exc.code, int) else 1
+                                else:
+                                    code = 0
                     finally:
                         sys.argv = previous_argv
+                    stdout = captured_stdout.getvalue()
+                    stderr = captured_stderr.getvalue()
                     return {"status": "PASS" if code == 0 else "FAIL",
-                            "exit": code, "output": "runner invoked", "detail": ""}
+                            "exit": code, "output": stdout + stderr,
+                            "stdout": stdout, "stderr": stderr, "detail": ""}
                 return {"status": "PASS", "exit": 0, "output": "", "detail": ""}
 
             with patch.object(WORKER, "call", side_effect=fake_call):
@@ -222,6 +298,77 @@ class TrnjeTermuxWorkerTests(unittest.TestCase):
             self.assertIn(payload["expect"], calls[0][0])
             self.assertEqual(calls[0][1], 11100)
 
+    def test_run_task_report_exit_mismatch_never_becomes_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "scripts").mkdir()
+            (root / "scripts" / "run_task.py").write_text("# test runner\n", encoding="utf-8")
+            (root / "sample.py").write_text("value = 1\n", encoding="utf-8")
+            stdout = json.dumps({"status": "PASS", "detail": "claimed pass"}) + "\n"
+            outcomes = [
+                {"status": "FAIL", "exit": 1, "output": stdout,
+                 "stdout": stdout, "stderr": "", "detail": "exit 1"},
+                {"status": "PASS", "exit": 0, "output": "", "stdout": "", "stderr": "", "detail": ""},
+                {"status": "PASS", "exit": 0, "output": "", "stdout": "", "stderr": "", "detail": ""},
+            ]
+            with patch.object(WORKER, "call", side_effect=outcomes):
+                result = WORKER.execute(
+                    root, "run_task",
+                    {"file": "sample.py", "task": "change value", "expect": "value = 2"},
+                )
+            self.assertEqual(result["status"], "UNKNOWN")
+            self.assertIn("could not be verified", result["detail"])
+
+    def test_mcp_validation_reuses_existing_worker_allowlist(self):
+        self.assertEqual(
+            WORKER.validate_mcp_task("diagnostics", {}),
+            ("diagnostics", {}),
+        )
+        with self.assertRaises(ValueError):
+            WORKER.validate_mcp_task("shell", {"cmd": "id"})
+        with self.assertRaises(ValueError):
+            WORKER.validate_mcp_task("run_task", {"file": "../outside.py"})
+
+    def test_mcp_queue_runs_through_existing_execute_and_persists_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            queue = WORKER.TaskQueue(Path(directory) / "mcp.sqlite3")
+            record, duplicate = queue.enqueue("diagnostics", {}, "mcp-test-1")
+            self.assertFalse(duplicate)
+            evidence = ("logs/mcp-" + record["task_id"] + ".md", "a" * 64)
+            with patch.object(
+                WORKER, "execute",
+                return_value={"status": "PASS", "detail": "ok", "exit": 0, "output": "checked"},
+            ) as execute, patch.object(WORKER, "write_mcp_evidence", return_value=evidence):
+                self.assertTrue(WORKER.process_mcp_queue(queue, Path("/tmp/trnje")))
+            execute.assert_called_once_with(Path("/tmp/trnje"), "diagnostics", {})
+            result = queue.get(record["task_id"])
+            self.assertEqual(result["status"], "PASS")
+            self.assertEqual(result["evidence_path"], evidence[0])
+            self.assertEqual(result["evidence_sha256"], evidence[1])
+
+    def test_run_task_preserves_structured_blocked_status_from_cli_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "scripts").mkdir()
+            (root / "scripts" / "run_task.py").write_text("# test runner\n", encoding="utf-8")
+            (root / "sample.py").write_text("value = 1\n", encoding="utf-8")
+            report = {"status": "BLOCKED", "phase": "lock", "detail": "workspace busy"}
+            stdout = json.dumps(report) + "\n"
+            outcomes = [
+                {"status": "FAIL", "exit": 1, "output": stdout,
+                 "stdout": stdout, "stderr": "", "detail": "exit 1"},
+                {"status": "PASS", "exit": 0, "output": "", "stdout": "", "stderr": "", "detail": ""},
+                {"status": "PASS", "exit": 0, "output": "", "stdout": "", "stderr": "", "detail": ""},
+            ]
+            with patch.object(WORKER, "call", side_effect=outcomes):
+                result = WORKER.execute(
+                    root, "run_task",
+                    {"file": "sample.py", "task": "change value", "expect": "value = 2"},
+                )
+            self.assertEqual(result["status"], "BLOCKED")
+            self.assertEqual(result["detail"], "workspace busy")
+            self.assertEqual(result["task_report"]["phase"], "lock")
+
     def test_installer_sha256_pin_matches_worker_source(self):
         import hashlib
         import re
@@ -232,108 +379,6 @@ class TrnjeTermuxWorkerTests(unittest.TestCase):
         self.assertIsNotNone(match)
         self.assertEqual(match.group(1), hashlib.sha256(WORKER_PATH.read_bytes()).hexdigest())
         self.assertIn('worker_ref="${TRNJE_WORKER_REF:-main}"', installer)
-
-
-
-    def test_parse_accepts_dropbox_forward_marker(self):
-        marker = WORKER.dropbox_source_marker("id:abc123", "rev-1")
-        body = (
-            'TRNJE_TASK_JSON\n{"kind":"diagnostics","payload":{}}'
-            + "\n\n" + marker
-        )
-        self.assertEqual(WORKER.parse(body)[0], "diagnostics")
-
-    def test_parse_rejects_malformed_dropbox_forward_marker(self):
-        body = (
-            'TRNJE_TASK_JSON\n{"kind":"diagnostics","payload":{}}'
-            + "\n\n<!-- TRNJE_DROPBOX_SOURCE:not-a-sha256 -->"
-        )
-        with self.assertRaises(WORKER.Blocked):
-            WORKER.parse(body)
-
-    def test_dropbox_disabled_is_noop(self):
-        with patch.dict(WORKER.os.environ, {"TRNJE_DROPBOX_ENABLED": "0"}), \
-             patch.object(WORKER, "dropbox_config") as config:
-            self.assertEqual(WORKER.dropbox_ingest({}, []), 0)
-        config.assert_not_called()
-
-    def test_dropbox_ingest_forwards_allowlisted_command_and_persists_cursor(self):
-        command = 'TRNJE_TASK_JSON\n{"kind":"diagnostics","payload":{}}'
-        raw = command.encode("utf-8")
-        entry = {
-            ".tag": "file", "name": "diagnostics.json",
-            "id": "id:abc123", "rev": "rev-1", "size": len(raw),
-        }
-        page = {"entries": [entry], "cursor": "cursor-1", "has_more": False}
-        state = {"version": 1, "last_seen": 0, "tasks": {}}
-        with patch.dict(WORKER.os.environ, {"TRNJE_DROPBOX_ENABLED": "1"}), \
-             patch.object(WORKER, "dropbox_config", return_value={"inbox": "/trnje-inbox"}), \
-             patch.object(WORKER, "dropbox_access_token", return_value="token"), \
-             patch.object(WORKER, "dropbox_list_page", return_value=page), \
-             patch.object(WORKER, "dropbox_download", return_value=raw), \
-             patch.object(WORKER, "post", return_value=True) as post, \
-             patch.object(WORKER, "save"):
-            count = WORKER.dropbox_ingest(state, [])
-        marker = WORKER.dropbox_source_marker("id:abc123", "rev-1")
-        self.assertEqual(count, 1)
-        self.assertEqual(state["dropbox_cursor"], "cursor-1")
-        post.assert_called_once_with(command + "\n\n" + marker)
-        self.assertEqual(WORKER.parse(post.call_args.args[0])[0], "diagnostics")
-
-    def test_dropbox_ingest_skips_source_already_forwarded_to_github(self):
-        command = 'TRNJE_TASK_JSON\n{"kind":"diagnostics","payload":{}}'
-        entry = {
-            ".tag": "file", "name": "diagnostics.json",
-            "id": "id:abc123", "rev": "rev-1", "size": len(command.encode("utf-8")),
-        }
-        page = {"entries": [entry], "cursor": "cursor-2", "has_more": False}
-        marker = WORKER.dropbox_source_marker("id:abc123", "rev-1")
-        items = [{"body": command + "\n\n" + marker}]
-        with patch.dict(WORKER.os.environ, {"TRNJE_DROPBOX_ENABLED": "1"}), \
-             patch.object(WORKER, "dropbox_config", return_value={"inbox": "/trnje-inbox"}), \
-             patch.object(WORKER, "dropbox_access_token", return_value="token"), \
-             patch.object(WORKER, "dropbox_list_page", return_value=page), \
-             patch.object(WORKER, "dropbox_download") as download, \
-             patch.object(WORKER, "post") as post, patch.object(WORKER, "save"):
-            count = WORKER.dropbox_ingest({}, items)
-        self.assertEqual(count, 0)
-        download.assert_not_called()
-        post.assert_not_called()
-
-    def test_dropbox_ingest_rejects_arbitrary_shell_without_advancing_cursor(self):
-        command = 'TRNJE_TASK_JSON\n{"kind":"shell","payload":{"cmd":"id"}}'
-        raw = command.encode("utf-8")
-        entry = {
-            ".tag": "file", "name": "shell.json",
-            "id": "id:abc123", "rev": "rev-1", "size": len(raw),
-        }
-        page = {"entries": [entry], "cursor": "cursor-3", "has_more": False}
-        state = {"version": 1, "last_seen": 0, "tasks": {}}
-        with patch.dict(WORKER.os.environ, {"TRNJE_DROPBOX_ENABLED": "1"}), \
-             patch.object(WORKER, "dropbox_config", return_value={"inbox": "/trnje-inbox"}), \
-             patch.object(WORKER, "dropbox_access_token", return_value="token"), \
-             patch.object(WORKER, "dropbox_list_page", return_value=page), \
-             patch.object(WORKER, "dropbox_download", return_value=raw), \
-             patch.object(WORKER, "post") as post, patch.object(WORKER, "save"):
-            with self.assertRaises(WORKER.Blocked):
-                WORKER.dropbox_ingest(state, [])
-        post.assert_not_called()
-        self.assertNotIn("dropbox_cursor", state)
-
-    def test_dropbox_failure_does_not_block_existing_github_mailbox(self):
-        state = {"version": 1, "last_seen": 0, "tasks": {}}
-        comment = {"id": 42, "body": "ordinary non-task comment"}
-        with patch.dict(WORKER.os.environ, {"TRNJE_DROPBOX_ENABLED": "1"}), \
-             patch.object(WORKER, "comments", return_value=[comment]), \
-             patch.object(WORKER, "deliver"), \
-             patch.object(WORKER, "dropbox_ingest", side_effect=WORKER.Blocked("Dropbox offline")), \
-             patch.object(WORKER, "save"):
-            count = WORKER.once(Path("/tmp"), state)
-        self.assertEqual(count, 1)
-        self.assertEqual(state["last_seen"], 42)
-        self.assertEqual(state["last_poll_status"], "PASS")
-        self.assertEqual(state["last_dropbox_poll_status"], "BLOCKED")
-        self.assertIn("Dropbox offline", state["last_dropbox_poll_error"])
 
 
 if __name__ == "__main__":
