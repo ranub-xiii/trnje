@@ -21,12 +21,13 @@ from typing import Any, Callable
 from trnje_api_queue import IdempotencyConflict, QueueFull
 
 
-SUPPORTED_PROTOCOLS = (
-    "2026-07-28",
+MODERN_PROTOCOL_VERSION = "2026-07-28"
+LEGACY_PROTOCOLS = (
     "2025-11-25",
     "2025-06-18",
     "2025-03-26",
 )
+SUPPORTED_PROTOCOLS = (MODERN_PROTOCOL_VERSION, *LEGACY_PROTOCOLS)
 MAX_BODY_BYTES = 65_536
 MAX_TOKEN_CHARS = 8_192
 READ_SCOPE = "trnje:read"
@@ -39,6 +40,18 @@ class MCPConfigurationError(RuntimeError):
 
 class OAuthError(RuntimeError):
     pass
+
+
+class InvalidToken(OAuthError):
+    """The presented bearer token is invalid for this resource."""
+
+
+class InsufficientScope(OAuthError):
+    """The token is valid but lacks a required permission."""
+
+
+class OAuthUnavailable(OAuthError):
+    """The authorization server could not validate the token."""
 
 
 @dataclass(frozen=True)
@@ -60,7 +73,7 @@ class MCPConfig:
 
     @property
     def resource_metadata_url(self) -> str:
-        return self.public_base_url.rstrip("/") + "/.well-known/oauth-protected-resource"
+        return self.public_base_url.rstrip("/") + "/.well-known/oauth-protected-resource/mcp"
 
     @classmethod
     def from_env(cls) -> "MCPConfig":
@@ -183,14 +196,14 @@ class OAuthIntrospection:
 
     def verify(self, authorization: str | None, required_scope: str) -> dict[str, Any]:
         if not isinstance(authorization, str) or not authorization.startswith("Bearer "):
-            raise OAuthError("A Bearer access token is required.")
+            raise InvalidToken("A Bearer access token is required.")
         token = authorization[7:]
         if (
             not token
             or len(token) > MAX_TOKEN_CHARS
             or any(char.isspace() for char in token)
         ):
-            raise OAuthError("Bearer token format is invalid.")
+            raise InvalidToken("Bearer token format is invalid.")
 
         # RFC 6749 §2.3.1 requires form-encoding each client credential
         # before applying HTTP Basic authentication.
@@ -216,38 +229,44 @@ class OAuthIntrospection:
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                 if response.status != 200:
-                    raise OAuthError("OAuth introspection endpoint returned a non-200 response.")
+                    raise OAuthUnavailable(
+                        "OAuth introspection endpoint returned a non-200 response."
+                    )
                 raw = response.read(65_537)
                 if len(raw) > 65_536:
-                    raise OAuthError("OAuth introspection response exceeded its size limit.")
+                    raise OAuthUnavailable(
+                        "OAuth introspection response exceeded its size limit."
+                    )
             data = json.loads(raw.decode("utf-8"))
-        except OAuthError:
+        except OAuthUnavailable:
             raise
         except (urllib.error.URLError, TimeoutError, OSError):
-            raise OAuthError("OAuth introspection service is unavailable.") from None
+            # HTTP 401/403 from the introspection endpoint is an outage/misconfiguration,
+            # not evidence that the caller's access token is invalid.
+            raise OAuthUnavailable("OAuth introspection service is unavailable.") from None
         except (UnicodeDecodeError, json.JSONDecodeError):
-            raise OAuthError("OAuth introspection response was invalid.") from None
+            raise OAuthUnavailable("OAuth introspection response was invalid.") from None
 
         if not isinstance(data, dict) or data.get("active") is not True:
-            raise OAuthError("Access token is inactive.")
+            raise InvalidToken("Access token is inactive.")
         issuer = data.get("iss")
         if issuer is not None and (
             not isinstance(issuer, str)
             or issuer.rstrip("/") != self.config.issuer.rstrip("/")
         ):
-            raise OAuthError("Access token issuer does not match the configured issuer.")
+            raise InvalidToken("Access token issuer does not match the configured issuer.")
         audience = data.get("aud")
         audiences = [audience] if isinstance(audience, str) else audience
         if not isinstance(audiences, list) or self.config.audience not in audiences:
-            raise OAuthError("Access token audience does not match this MCP resource.")
+            raise InvalidToken("Access token audience does not match this MCP resource.")
 
         now = int(time.time())
         expires = data.get("exp")
         not_before = data.get("nbf")
         if expires is not None and (type(expires) is not int or expires <= now):
-            raise OAuthError("Access token has expired.")
+            raise InvalidToken("Access token has expired.")
         if not_before is not None and (type(not_before) is not int or not_before > now):
-            raise OAuthError("Access token is not yet valid.")
+            raise InvalidToken("Access token is not yet valid.")
 
         scope_value = data.get("scope", data.get("scp", []))
         if isinstance(scope_value, str):
@@ -257,8 +276,36 @@ class OAuthIntrospection:
         else:
             scopes = set()
         if required_scope not in scopes:
-            raise OAuthError("Access token lacks the required scope.")
+            raise InsufficientScope("Access token lacks the required scope.")
         return {"scopes": sorted(scopes)}
+
+
+def _decode_mcp_name(value: str | None) -> str | None:
+    """Decode a modern Mcp-Name value, rejecting unsafe or malformed encodings."""
+    if not isinstance(value, str) or not value:
+        return None
+    prefix, suffix = "=?base64?", "?="
+    if value.startswith(prefix) and value.endswith(suffix):
+        encoded = value[len(prefix):-len(suffix)]
+        try:
+            return base64.b64decode(encoded, validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return None
+    if value != value.strip(" \\t") or any(
+        (ord(char) < 0x20 and char != "\\t") or ord(char) > 0x7E
+        for char in value
+    ):
+        return None
+    return value
+
+
+def _valid_mcp_method_header(value: str | None) -> bool:
+    return bool(
+        isinstance(value, str)
+        and value
+        and value == value.strip(" \\t")
+        and all(0x21 <= ord(char) <= 0x7E for char in value)
+    )
 
 
 def _json_pairs_no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -429,16 +476,94 @@ def create_server(
                 return
             origin = self.headers.get("Origin")
             headers = {
-                "Allow": "GET, POST, OPTIONS",
-                "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                "Allow": "POST, OPTIONS",
+                "Access-Control-Allow-Methods": "POST, OPTIONS",
                 "Access-Control-Allow-Headers": (
-                    "Authorization, Content-Type, MCP-Protocol-Version, Idempotency-Key"
+                    "Authorization, Content-Type, MCP-Protocol-Version, Mcp-Method, Mcp-Name, Idempotency-Key"
                 ),
                 "Vary": "Origin",
             }
             if origin:
                 headers["Access-Control-Allow-Origin"] = origin
             self._send(204, headers=headers)
+
+        def _validate_modern_request(
+            self, request: dict[str, Any], request_id: Any,
+            method: str, params: dict[str, Any],
+        ) -> bool | None:
+            meta = params.get("_meta")
+            meta_version = (
+                meta.get("io.modelcontextprotocol/protocolVersion")
+                if isinstance(meta, dict) else None
+            )
+            protocol_header = self.headers.get("MCP-Protocol-Version")
+            modern_hint = (
+                method == "server/discover"
+                or meta_version is not None
+                or protocol_header == MODERN_PROTOCOL_VERSION
+                or (
+                    protocol_header is not None
+                    and protocol_header not in LEGACY_PROTOCOLS
+                )
+            )
+            if not modern_hint:
+                if protocol_header is not None and protocol_header not in SUPPORTED_PROTOCOLS:
+                    self._rpc_error(
+                        request_id, -32022, "Unsupported protocol version",
+                        status=400,
+                        data={"supported": list(LEGACY_PROTOCOLS), "requested": protocol_header},
+                    )
+                    return False
+                return None
+
+            if (
+                not isinstance(meta, dict)
+                or not isinstance(meta_version, str)
+                or protocol_header != meta_version
+            ):
+                self._rpc_error(
+                    request_id, -32020, "Header mismatch: MCP-Protocol-Version must match request _meta.",
+                    status=400,
+                )
+                return False
+
+            if meta_version != MODERN_PROTOCOL_VERSION:
+                self._rpc_error(
+                    request_id, -32022, "Unsupported protocol version",
+                    status=400,
+                    data={
+                        "supported": [MODERN_PROTOCOL_VERSION],
+                        "requested": meta_version,
+                    },
+                )
+                return False
+
+            method_header = self.headers.get("Mcp-Method")
+            if not _valid_mcp_method_header(method_header) or method_header != method:
+                self._rpc_error(
+                    request_id, -32020, "Header mismatch: Mcp-Method must match request method.",
+                    status=400,
+                )
+                return False
+
+            name_source = None
+            if method in ("tools/call", "prompts/get"):
+                name_source = params.get("name")
+            elif method == "resources/read":
+                name_source = params.get("uri")
+            if method in ("tools/call", "resources/read", "prompts/get"):
+                name_header = _decode_mcp_name(self.headers.get("Mcp-Name"))
+                if (
+                    not isinstance(name_source, str)
+                    or name_header is None
+                    or name_header != name_source
+                ):
+                    self._rpc_error(
+                        request_id, -32020, "Header mismatch: Mcp-Name must match request params.",
+                        status=400,
+                    )
+                    return False
+            return True
 
         def do_POST(self) -> None:
             if not self._security_check():
@@ -470,7 +595,7 @@ def create_server(
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
                 self._send(400, {"error": "invalid_json"})
                 return
-            if not isinstance(request, dict) or isinstance(request, list):
+            if not isinstance(request, dict):
                 self._send(400, {"error": "one_json_rpc_message_required"})
                 return
             if request.get("jsonrpc") != "2.0" or not isinstance(request.get("method"), str):
@@ -481,10 +606,6 @@ def create_server(
                 isinstance(request_id, bool) or not isinstance(request_id, (str, int))
             ):
                 self._rpc_error(None, -32600, "Invalid Request")
-                return
-            protocol_header = self.headers.get("MCP-Protocol-Version")
-            if protocol_header is not None and protocol_header not in SUPPORTED_PROTOCOLS:
-                self._send(400, {"error": "unsupported_mcp_protocol_version"})
                 return
             method = request["method"]
             params = request.get("params", {})
@@ -497,6 +618,10 @@ def create_server(
                 self._rpc_error(None, -32600, "Request ID is required")
                 return
 
+            modern = self._validate_modern_request(request, request_id, method, params)
+            if modern is False:
+                return
+
             required_scope = WRITE_SCOPE if (
                 method == "tools/call"
                 and isinstance(params.get("name"), str)
@@ -504,15 +629,32 @@ def create_server(
             ) else READ_SCOPE
             try:
                 auth.verify(self.headers.get("Authorization"), required_scope)
+            except InsufficientScope:
+                challenge = (
+                    'Bearer error="insufficient_scope", scope="' + required_scope
+                    + '", resource_metadata="' + config.resource_metadata_url + '"'
+                )
+                self._send(
+                    403,
+                    {"error": "insufficient_scope"},
+                    headers={"WWW-Authenticate": challenge},
+                )
+                return
+            except OAuthUnavailable:
+                self._send(
+                    503,
+                    {"error": "authorization_service_unavailable"},
+                    headers={"Retry-After": "5"},
+                )
+                return
             except OAuthError:
                 challenge = (
-                    'Bearer resource_metadata="'
-                    + config.resource_metadata_url
-                    + '", scope="' + required_scope + '"'
+                    'Bearer error="invalid_token", resource_metadata="'
+                    + config.resource_metadata_url + '", scope="' + required_scope + '"'
                 )
                 self._send(
                     401,
-                    {"error": "unauthorized"},
+                    {"error": "invalid_token"},
                     headers={"WWW-Authenticate": challenge},
                 )
                 return
@@ -520,14 +662,42 @@ def create_server(
             if method in ("notifications/initialized", "notifications/cancelled"):
                 self._send(202)
                 return
-            if method == "initialize":
-                requested = params.get("protocolVersion")
-                selected = requested if requested in SUPPORTED_PROTOCOLS else SUPPORTED_PROTOCOLS[0]
+            if modern is True and method == "server/discover":
+                if set(params) - {"_meta"}:
+                    self._rpc_error(request_id, -32602, "Invalid params")
+                    return
                 self._send(200, {
                     "jsonrpc": "2.0",
                     "id": request_id,
                     "result": {
-                        "protocolVersion": selected,
+                        "resultType": "complete",
+                        "supportedVersions": [MODERN_PROTOCOL_VERSION],
+                        "capabilities": {"tools": {}},
+                        "_meta": {
+                            "io.modelcontextprotocol/serverInfo": {
+                                "name": "trnje", "version": "1.0.0"
+                            }
+                        },
+                        "instructions": (
+                            "TRNJE accepts bounded allowlisted tasks. Submissions are queued "
+                            "and must be checked by task ID; queued does not mean completed."
+                        ),
+                    },
+                })
+                return
+            if method == "initialize" and modern is not True:
+                requested = params.get("protocolVersion")
+                if requested not in LEGACY_PROTOCOLS:
+                    self._rpc_error(
+                        request_id, -32602, "Unsupported legacy protocol version",
+                        data={"supported": list(LEGACY_PROTOCOLS), "requested": requested},
+                    )
+                    return
+                self._send(200, {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {
+                        "protocolVersion": requested,
                         "capabilities": {"tools": {"listChanged": False}},
                         "serverInfo": {"name": "trnje", "version": "1.0.0"},
                         "instructions": (
@@ -567,13 +737,22 @@ def create_server(
                     },
                 })
                 return
-            self._rpc_error(request_id, -32601, "Method not found")
+            if modern is True:
+                self._rpc_error(request_id, -32601, "Method not found", status=404)
+            else:
+                self._rpc_error(request_id, -32601, "Method not found")
 
-        def _rpc_error(self, request_id: Any, code: int, message: str) -> None:
-            self._send(200, {
+        def _rpc_error(
+            self, request_id: Any, code: int, message: str, *,
+            status: int = 200, data: dict[str, Any] | None = None,
+        ) -> None:
+            error: dict[str, Any] = {"code": code, "message": message}
+            if data is not None:
+                error["data"] = data
+            self._send(status, {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "error": {"code": code, "message": message},
+                "error": error,
             })
 
         def _call_tool(self, params: dict[str, Any]) -> tuple[dict[str, Any], bool]:
