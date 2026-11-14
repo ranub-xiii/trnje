@@ -93,7 +93,7 @@ fetch_python_file "scripts/trnje_mcp_http.py" "$mcp_tmp"
 
 expected_worker_sha256="a409c016bb89cffdd97034bdda9a688ddf2a022044c49a1d1a92b4f757cca47a"
 expected_queue_sha256="c3ff841837686b61b5638ae118c9d5cab815a9b542c437a474ee8da97b6582de"
-expected_mcp_sha256="a5ad1e4941358677dd6435550515f45f33c1435bd43ebd8fca334c96c6854b78"
+expected_mcp_sha256="0a4c7078576bbd4956cd6db860879fe4fa15d0ffb6806696827d6568ead68513"
 actual_worker_sha256="$(python -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$worker_tmp")"
 actual_queue_sha256="$(python -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$queue_tmp")"
 actual_mcp_sha256="$(python -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$mcp_tmp")"
