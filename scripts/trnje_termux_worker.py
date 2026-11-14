@@ -15,10 +15,18 @@ import stat
 import subprocess
 import sys
 import time
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from trnje_api_queue import TaskQueue
+from trnje_mcp_http import create_server as create_mcp_server
 
 REPO, ISSUE = "ranub-xiii/trnje", 3
 ACTORS = {"xiiitore", "ranub-xiii"}
@@ -43,7 +51,7 @@ _DROPBOX_ACCESS_TOKEN_EXPIRES = 0.0
 REDACT = [
     re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"),
     re.compile(r"\bsl\.[A-Za-z0-9_-]{20,}\b"),
-    re.compile(r"(?i)\b(authorization|access[_ -]?token|refresh[_ -]?token|password|client[_ -]?secret|api[_ -]?key|secret[_ -]?key)\s*[:=]\s*[^\s,;]+"),
+    re.compile(r"(?i)\b(authorization|access[_ -]?token|refresh[_ -]?token|password|client[_ -]?secret|api[_ -]?key|secret[_ -]?key)\s*[:=]\s*[^\s,;\"']+"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
 ]
 DENIED = {".git", ".ssh", ".config", ".env", "credentials", "credential", "secrets", "secret", "token", "tokens"}
@@ -57,6 +65,29 @@ def clean(s: str) -> str:
     for pattern in REDACT:
         s = pattern.sub("[REDACTED]", s)
     return s[:MAX_TEXT]
+
+
+def redact_structure(value):
+    """Redact secret-bearing fields recursively before persistence or API output."""
+    sensitive_names = {
+        "authorization", "token", "accesstoken", "refreshtoken",
+        "password", "clientsecret", "apikey", "secretkey", "secret",
+        "credential", "credentials",
+    }
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+            redacted[key] = (
+                "[REDACTED]" if normalized in sensitive_names
+                else redact_structure(item)
+            )
+        return redacted
+    if isinstance(value, list):
+        return [redact_structure(item) for item in value]
+    if isinstance(value, str):
+        return clean(value)
+    return value
 
 
 def env() -> dict[str, str]:
@@ -73,12 +104,15 @@ def call(argv: list[str], cwd: Path | None = None, timeout: int = 60) -> dict:
                            capture_output=True, text=True, timeout=timeout, check=False,
                            shell=False, env=env())
     except subprocess.TimeoutExpired:
-        return {"status": "BLOCKED", "exit": None, "output": "", "detail": f"timeout after {timeout}s"}
+        return {"status": "BLOCKED", "exit": None, "output": "", "stdout": "", "stderr": "",
+                "detail": f"timeout after {timeout}s"}
     except OSError as exc:
-        return {"status": "BLOCKED", "exit": None, "output": "", "detail": type(exc).__name__}
-    out = clean((p.stdout or "") + (p.stderr or ""))
+        return {"status": "BLOCKED", "exit": None, "output": "", "stdout": "", "stderr": "",
+                "detail": type(exc).__name__}
+    stdout, stderr = clean(p.stdout or ""), clean(p.stderr or "")
+    out = clean(stdout + stderr)
     return {"status": "PASS" if p.returncode == 0 else "FAIL",
-            "exit": p.returncode, "output": out,
+            "exit": p.returncode, "output": out, "stdout": stdout, "stderr": stderr,
             "detail": "" if p.returncode == 0 else f"exit {p.returncode}"}
 
 
@@ -130,17 +164,47 @@ def save(s: dict) -> None:
         tmp.unlink(missing_ok=True)
 
 
+GH_RETRY_DELAYS = (2, 5)
+GH_TRANSIENT_ERROR = re.compile(
+    r"(?i)(TLS handshake timeout|i/o timeout|connection reset by peer|"
+    r"connection timed out|temporary failure in name resolution|"
+    r"unexpected EOF|unexpected end of file|HTTP 5[0-9]{2})"
+)
+
+
 def gh(args: list[str], timeout: int = 30) -> str:
-    try:
-        p = subprocess.run(["gh", "api", *args], stdin=subprocess.DEVNULL, capture_output=True,
-                           text=True, timeout=timeout, check=False, shell=False, env=env())
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise Blocked(f"GitHub API request failed ({type(exc).__name__}).")
-    if p.returncode:
-        raise Blocked("GitHub API request failed: " + clean(p.stderr or p.stdout)[:400])
-    return p.stdout
+    """Call GitHub CLI, retrying only bounded, recognizable transient failures."""
+    command = ["gh", "api", *args]
+    for attempt in range(len(GH_RETRY_DELAYS) + 1):
+        try:
+            p = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
+                               text=True, timeout=timeout, check=False, shell=False, env=env())
+        except subprocess.TimeoutExpired as exc:
+            if attempt < len(GH_RETRY_DELAYS):
+                time.sleep(GH_RETRY_DELAYS[attempt])
+                continue
+            raise Blocked(
+                f"GitHub API request failed after {attempt + 1} attempts "
+                f"(TimeoutExpired; retry limit reached)."
+            ) from exc
+        except OSError as exc:
+            # Missing executables and local configuration errors are not network retries.
+            raise Blocked(f"GitHub API request failed ({type(exc).__name__}).") from exc
 
+        if p.returncode == 0:
+            return p.stdout
 
+        error = clean(p.stderr or p.stdout)
+        transient = bool(GH_TRANSIENT_ERROR.search(error))
+        if transient and attempt < len(GH_RETRY_DELAYS):
+            time.sleep(GH_RETRY_DELAYS[attempt])
+            continue
+        reason = "retry limit reached" if transient else "non-retryable error"
+        raise Blocked(
+            f"GitHub API request failed after {attempt + 1} attempt(s) "
+            f"({reason}): {error[:400]}"
+        )
+    raise Blocked("GitHub API request failed: retry loop exhausted.")
 def verify_gh() -> str:
     if not shutil.which("gh"):
         raise Blocked("GitHub CLI gh is missing.")
@@ -343,6 +407,28 @@ def execute(r: Path, kind: str, p: dict) -> dict:
                "--task", p["task"], "--expect", p["expect"], "--model-timeout", "10800", "--check-timeout", "180"]
         # Allow the model timeout plus check execution and process startup/teardown.
         x = call(cmd, r, 11100)
+        # The runner's structured TaskReport is authoritative for BLOCKED/FAIL/PASS.
+        # Do not collapse every nonzero CLI exit into FAIL.
+        if x["exit"] is not None:
+            try:
+                report = json.loads(x.get("stdout", ""))
+                report_status = report.get("status") if isinstance(report, dict) else None
+                if report_status not in {"PASS", "FAIL", "BLOCKED", "UNKNOWN"}:
+                    raise ValueError("unrecognized TaskReport status")
+                expected_exit = 0 if report_status == "PASS" else 1
+                if x["exit"] != expected_exit:
+                    raise ValueError("TaskReport status and CLI exit code disagree")
+                x["status"] = report_status
+                # Sanitize the complete structured report before it reaches
+                # SQLite, the MCP response, or the durable evidence log.
+                safe_report = redact_structure(report)
+                x["detail"] = clean(str(safe_report.get("detail", "")))[:400]
+                x["task_report"] = safe_report
+            except (ValueError, TypeError):
+                x["status"] = "UNKNOWN"
+                x["detail"] = "Runner exited but its structured TaskReport could not be verified."
+        x.pop("stdout", None)
+        x.pop("stderr", None)
         after = call(["git", "status", "--short"], r, 20)
         diff = call(["git", "diff", "--stat"], r, 20)
         x["output"] = (x["output"] + "\n\nPost-task worktree:\n"
@@ -739,6 +825,104 @@ def once(r: Path, s: dict) -> int:
     return n + forwarded
 
 
+
+
+def validate_mcp_task(kind: str, payload: dict) -> tuple[str, dict]:
+    """Apply exactly the same allowlist/schema checks to MCP and mailbox tasks."""
+    if not isinstance(kind, str) or not isinstance(payload, dict):
+        raise ValueError("Task kind and payload must be valid.")
+    try:
+        body = MARK + "\n" + json.dumps(
+            {"kind": kind, "payload": payload}, ensure_ascii=False,
+            separators=(",", ":"), allow_nan=False,
+        )
+        return parse(body)
+    except (Blocked, TypeError, ValueError):
+        raise ValueError("Task refused by the existing TRNJE allowlist/schema.") from None
+
+def write_mcp_evidence(task: dict, result: dict) -> tuple[str, str]:
+    """Persist a redacted, fsynced result record and return its path and digest."""
+    dirs()
+    LOGS.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        LOGS.chmod(0o700)
+    except OSError:
+        pass
+    record = {
+        "task_id": task["task_id"],
+        "kind": task["kind"],
+        "status": result.get("status"),
+        "detail": clean(str(result.get("detail", "")))[:400],
+        "exit_code": result.get("exit"),
+        "output": clean(str(result.get("output", ""))),
+        "task_report": result.get("task_report"),
+    }
+    body = "# TRNJE direct MCP task\n\n~~~json\n"
+    body += json.dumps(record, ensure_ascii=False, sort_keys=True, indent=2)
+    body += "\n~~~\n"
+    path = LOGS / ("mcp-" + task["task_id"] + ".md")
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(body)
+        handle.flush()
+        os.fsync(handle.fileno())
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    return str(path), digest
+
+
+def process_mcp_queue(queue: TaskQueue, workspace: Path) -> bool:
+    """Execute at most one queued API task on the existing worker thread."""
+    task = queue.claim_next()
+    if task is None:
+        return False
+    try:
+        result = execute(workspace, task["kind"], task["payload"])
+    except Blocked as exc:
+        result = {"status": "BLOCKED", "detail": clean(str(exc)), "exit": None, "output": ""}
+    except Exception as exc:
+        result = {
+            "status": "FAIL",
+            "detail": "Worker task failed (" + type(exc).__name__ + ").",
+            "exit": None,
+            "output": "",
+        }
+
+    if result.get("status") not in {"PASS", "FAIL", "BLOCKED", "UNKNOWN"}:
+        result = {
+            "status": "UNKNOWN",
+            "detail": "Executor returned an unrecognized status; no success is claimed.",
+            "exit": result.get("exit"),
+            "output": clean(str(result.get("output", ""))),
+        }
+    try:
+        evidence_path, evidence_sha256 = write_mcp_evidence(task, result)
+    except Exception as exc:
+        result = {
+            "status": "UNKNOWN",
+            "detail": "Task execution finished, but durable evidence could not be written ("
+                      + type(exc).__name__ + ").",
+            "exit": result.get("exit"),
+            "output": clean(str(result.get("output", ""))),
+        }
+        evidence_path, evidence_sha256 = "", ""
+    try:
+        queue.complete(
+            task["task_id"], result,
+            evidence_path=evidence_path,
+            evidence_sha256=evidence_sha256,
+        )
+        print(
+            "MCP task " + task["task_id"] + ": " + result["status"],
+            flush=True,
+        )
+    except Exception as exc:
+        # The task remains RUNNING. Startup recovery will mark it UNKNOWN, never replay it.
+        print(
+            "BLOCKED: MCP result persistence failed (" + type(exc).__name__ + ").",
+            file=sys.stderr, flush=True,
+        )
+    return True
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--once", action="store_true")
@@ -754,35 +938,130 @@ def main() -> int:
         print("BLOCKED: another Trnje worker holds the lock.", file=sys.stderr)
         os.close(fd)
         return 2
+
+    mcp_server = None
+    mcp_thread = None
     try:
         r = root()
-        login = verify_gh()
         s = load()
         recover(s)
-        print(f"Trnje worker ready: {login}; Issue #{ISSUE}; workspace=$HOME/trnje-e2e-aRhnEF/repo", flush=True)
-        while True:
+        wake = threading.Event()
+        mcp_queue = None
+
+        if not a.once and os.environ.get("TRNJE_MCP_ENABLED") == "1":
             try:
-                n = once(r, s)
-                if n:
-                    print(f"Scanned {n} new mailbox items (GitHub and Dropbox forwards).", flush=True)
-            except Blocked as exc:
-                s["last_poll_at"] = int(time.time())
-                s["last_poll_status"] = "BLOCKED"
-                s["last_poll_error"] = clean(str(exc))[:300]
-                save(s)
-                print(f"BLOCKED: {exc}", file=sys.stderr, flush=True)
+                mcp_queue = TaskQueue(STATE / "mcp-tasks.sqlite3")
+                recovered = mcp_queue.recover_interrupted()
+                mcp_server = create_mcp_server(
+                    mcp_queue, validate_mcp_task, wake.set
+                )
+                mcp_thread = threading.Thread(
+                    target=mcp_server.serve_forever,
+                    name="trnje-mcp-http",
+                    daemon=True,
+                )
+                mcp_thread.start()
+                print(
+                    "TRNJE MCP gateway listening on 127.0.0.1:"
+                    + str(mcp_server.server_address[1])
+                    + "; recovered_as_unknown=" + str(recovered),
+                    flush=True,
+                )
+            except Exception as exc:
+                # MCP is optional: a bad OAuth/port config must not stop the existing mailbox worker.
+                if mcp_server is not None:
+                    mcp_server.server_close()
+                mcp_queue = None
+                mcp_server = None
+                mcp_thread = None
+                print(
+                    "BLOCKED: MCP gateway not started (" + type(exc).__name__
+                    + "); GitHub/Dropbox worker remains available.",
+                    file=sys.stderr, flush=True,
+                )
+
+        try:
+            login = verify_gh()
+            github_ready = True
+        except Blocked as exc:
             if a.once:
-                return 0
-            time.sleep(a.poll_seconds)
+                raise
+            login = "unavailable"
+            github_ready = False
+            print(
+                "BLOCKED: GitHub mailbox is unavailable at startup ("
+                + clean(str(exc))[:200] + "); direct MCP tasks may still run.",
+                file=sys.stderr, flush=True,
+            )
+
+        if a.once:
+            n = once(r, s)
+            if n:
+                print(f"Scanned {n} new mailbox items (GitHub and Dropbox forwards).", flush=True)
+            return 0
+
+        print(
+            "Trnje worker ready: " + login + "; Issue #" + str(ISSUE)
+            + "; workspace=$HOME/trnje-e2e-aRhnEF/repo",
+            flush=True,
+        )
+        next_poll = time.monotonic()
+        while True:
+            # Respect the mailbox poll deadline before starting another queued
+            # MCP task, so a steady stream of direct submissions cannot starve
+            # GitHub/Dropbox polling between task executions.
+            now = time.monotonic()
+            if now >= next_poll:
+                try:
+                    if not github_ready:
+                        login = verify_gh()
+                        github_ready = True
+                        print("PASS: GitHub mailbox connection restored.", flush=True)
+                    n = once(r, s)
+                    if n:
+                        print(
+                            f"Scanned {n} new mailbox items (GitHub and Dropbox forwards).",
+                            flush=True,
+                        )
+                except Blocked as exc:
+                    github_ready = False
+                    s["last_poll_at"] = int(time.time())
+                    s["last_poll_status"] = "BLOCKED"
+                    s["last_poll_error"] = clean(str(exc))[:300]
+                    save(s)
+                    print(f"BLOCKED: GitHub/Dropbox poll: {clean(str(exc))[:200]}", file=sys.stderr, flush=True)
+                next_poll = time.monotonic() + a.poll_seconds
+                continue
+
+            if mcp_queue is not None:
+                # Clear before claiming: an enqueue during the claim or execution
+                # leaves the event set and causes the next pass to run immediately.
+                wake.clear()
+                if process_mcp_queue(mcp_queue, r):
+                    continue
+
+            wait_seconds = max(0.0, next_poll - time.monotonic())
+            if mcp_queue is None:
+                time.sleep(wait_seconds)
+            else:
+                wake.wait(wait_seconds)
     except KeyboardInterrupt:
         return 130
     except Blocked as exc:
         print(f"BLOCKED: {exc}", file=sys.stderr)
         return 2
     finally:
+        if mcp_server is not None:
+            if mcp_thread is not None and mcp_thread.is_alive():
+                try:
+                    mcp_server.shutdown()
+                except Exception:
+                    pass
+            mcp_server.server_close()
+        if mcp_thread is not None:
+            mcp_thread.join(timeout=2)
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

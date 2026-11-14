@@ -4,7 +4,7 @@
 
 ## Current status
 
-**Prototype implementation has started on `feat/local-model-adapter`.** The branch adds a bounded `llama-cli` adapter, a smoke-test command, and unit tests for success and failure handling. This is not yet a complete coding agent, and no acceptance test AT-01 through AT-14 is claimed as passed.
+**The coding-agent prototype remains experimental.** The optional direct MCP gateway is being prepared on `feat/direct-mcp-gateway-20261114`, stacked on the Dropbox worker draft PR #11 so that its work is preserved. The gateway is disabled by default and has not been deployed to Termux. No acceptance test AT-01 through AT-14 is claimed as passed.
 
 ## Local model adapter
 
@@ -19,17 +19,24 @@ The command uses a bounded timeout and token count, emits a JSON result, and ret
 
 ## Minimal task loop (experimental)
 
-The first task loop is intentionally narrow: it inspects one explicitly selected file, asks the local model for one exact text replacement, applies it only if the old text matches exactly once, and runs the fixed repository checks. It does not retry, run model-supplied shell commands, commit, push, or merge. If verification fails after an edit, the changed file is left in place and the JSON report says so; inspect the diff before continuing.
+The first task loop is intentionally narrow: it inspects one explicitly selected file, asks the local model for one exact text replacement, applies it only if the old text matches exactly once, verifies the acceptance text, and runs the fixed repository checks. If acceptance or checks fail, it attempts a guarded rollback and verifies restoration; it refuses to overwrite an intervening change and reports when restoration cannot be proved. It does not retry automatically, run model-supplied shell commands, commit, push, or merge.
 
 ```bash
 export TRNJE_MODEL_PATH="$HOME/models/qwen2.5-coder-0.5b-instruct-q4_0.gguf"
 python scripts/run_task.py \
   --workspace "$HOME/trnje" \
   --file "path/inside/project.py" \
-  --task "Describe one small, testable correction"
+  --task "Describe one small, testable correction" \
+  --expect "exact text that must exist after the edit"
 ```
 
 Use a real relative path and a narrow task. This is an experimental one-file loop, not proof of full autonomous coding capability. Its output is a JSON report; exit code 0 means the fixed checks passed, not that the task was independently judged correct.
+
+## Direct MCP gateway (draft)
+
+A standard-library-only Streamable HTTP MCP gateway is being added to the existing single Termux worker. It uses a separate, bounded SQLite inbox for direct MCP submissions while preserving the legacy GitHub/Dropbox mailbox state. The HTTP handler only validates and queues tasks; the existing worker loop is still the only executor. OAuth token verification is delegated to a real external Authorization Server. The gateway is disabled by default and binds only to `127.0.0.1:8766`.
+
+See [MCP_GATEWAY.md](MCP_GATEWAY.md) for OAuth requirements, configuration, task tools, evidence handling, and the Cloudflare Tunnel boundary. The current ChatGPT Free plan does not include custom MCP server connections, so implementation readiness must not be confused with ChatGPT account availability.
 
 ## Prototype goal
 

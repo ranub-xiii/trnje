@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Installs only the standalone worker; does not modify either repository.
+# Installs the standalone TRNJE worker and its two stdlib-only MCP modules.
+# The worker is replaced last; a running worker is never restarted here.
 set -euo pipefail
 umask 077
 
@@ -24,12 +25,28 @@ repo_root="$HOME/trnje-e2e-aRhnEF/repo"
 publisher="$HOME/bin/trnje-publish"
 [ -x "$publisher" ] || fail '$HOME/bin/trnje-publish is missing or not executable.'
 
-destination="$HOME/bin/trnje-worker"
-[ ! -L "$destination" ] || fail "Refusing to replace a symlink at $destination."
+bin_dir="$HOME/bin"
+[ ! -L "$bin_dir" ] || fail "Refusing to use a symlink as $bin_dir."
+mkdir -p "$bin_dir"
+
+worker_destination="$bin_dir/trnje-worker"
+queue_destination="$bin_dir/trnje_api_queue.py"
+mcp_destination="$bin_dir/trnje_mcp_http.py"
+destinations=("$worker_destination" "$queue_destination" "$mcp_destination")
+
+for destination in "${destinations[@]}"; do
+  [ ! -L "$destination" ] || fail "Refusing to replace symlink: $destination"
+  if [ -e "$destination" ] && [ ! -f "$destination" ]; then
+    fail "Install target is not a regular file: $destination"
+  fi
+done
+
 if [ "$mode" = "install" ]; then
-  [ ! -e "$destination" ] || fail "Refusing to overwrite existing $destination; use --update."
+  for destination in "${destinations[@]}"; do
+    [ ! -e "$destination" ] || fail "Refusing to overwrite existing $destination; use --update."
+  done
 else
-  [ -f "$destination" ] || fail "--update requires an existing regular worker file."
+  [ -f "$worker_destination" ] || fail "--update requires an existing regular worker file."
 fi
 
 login="$(gh api user --jq .login 2>/dev/null || true)"
@@ -48,48 +65,87 @@ esac
 
 tmpdir="$(printenv TMPDIR 2>/dev/null || true)"
 [ -n "$tmpdir" ] || tmpdir="/tmp"
-tmp="$(mktemp "$tmpdir/trnje-worker.XXXXXX")"
-staged=""
+worker_tmp="$(mktemp "$tmpdir/trnje-worker.XXXXXX")"
+queue_tmp="$(mktemp "$tmpdir/trnje-queue.XXXXXX")"
+mcp_tmp="$(mktemp "$tmpdir/trnje-mcp.XXXXXX")"
+worker_staged=""
+queue_staged=""
+mcp_staged=""
 cleanup() {
-  rm -f "$tmp"
-  [ -z "$staged" ] || rm -f "$staged"
+  rm -f "$worker_tmp" "$queue_tmp" "$mcp_tmp"
+  [ -z "$worker_staged" ] || rm -f "$worker_staged"
+  [ -z "$queue_staged" ] || rm -f "$queue_staged"
+  [ -z "$mcp_staged" ] || rm -f "$mcp_staged"
 }
 trap cleanup EXIT HUP INT TERM
 
-# The repository is private: fetch through the authenticated GitHub CLI API.
-gh api "repos/ranub-xiii/trnje/contents/scripts/trnje_termux_worker.py?ref=${worker_ref}" --jq .content |
-  python -c 'import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))' > "$tmp"
+fetch_python_file() {
+  local path="$1"
+  local destination="$2"
+  gh api "repos/ranub-xiii/trnje/contents/${path}?ref=${worker_ref}" --jq .content |
+    python -c 'import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))' > "$destination"
+}
 
-expected_sha256="74a34f4b64b786d233a2784f0c778bd4aa449592cd5a4fbafeffbaa841e9098b"
-actual_sha256="$(python -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$tmp")"
-[ "$actual_sha256" = "$expected_sha256" ] || fail "Worker SHA-256 does not match the installer pin."
+# Fetch all three files from exactly the same immutable branch ref.
+fetch_python_file "scripts/trnje_termux_worker.py" "$worker_tmp"
+fetch_python_file "scripts/trnje_api_queue.py" "$queue_tmp"
+fetch_python_file "scripts/trnje_mcp_http.py" "$mcp_tmp"
 
-python - "$tmp" <<'PY'
+expected_worker_sha256="a409c016bb89cffdd97034bdda9a688ddf2a022044c49a1d1a92b4f757cca47a"
+expected_queue_sha256="c3ff841837686b61b5638ae118c9d5cab815a9b542c437a474ee8da97b6582de"
+expected_mcp_sha256="a5ad1e4941358677dd6435550515f45f33c1435bd43ebd8fca334c96c6854b78"
+actual_worker_sha256="$(python -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$worker_tmp")"
+actual_queue_sha256="$(python -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$queue_tmp")"
+actual_mcp_sha256="$(python -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$mcp_tmp")"
+[ "$actual_worker_sha256" = "$expected_worker_sha256" ] || fail "Worker SHA-256 does not match the installer pin."
+[ "$actual_queue_sha256" = "$expected_queue_sha256" ] || fail "Queue module SHA-256 does not match the installer pin."
+[ "$actual_mcp_sha256" = "$expected_mcp_sha256" ] || fail "MCP module SHA-256 does not match the installer pin."
+
+python - "$worker_tmp" "$queue_tmp" "$mcp_tmp" <<'PY'
 import pathlib
 import sys
-source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
-compile(source, sys.argv[1], "exec")
+for name in sys.argv[1:]:
+    source = pathlib.Path(name).read_text(encoding="utf-8")
+    compile(source, name, "exec")
 PY
 
-mkdir -p "$HOME/bin"
 if [ "$mode" = "--update" ]; then
   backup_dir="$HOME/.local/state/trnje-worker/backups"
   mkdir -p "$backup_dir"
   chmod 700 "$backup_dir"
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-  backup="$backup_dir/trnje-worker.$stamp.bak"
-  [ ! -e "$backup" ] || fail "Backup already exists; refusing to overwrite it."
-  cp -p "$destination" "$backup"
-  staged="$HOME/bin/.trnje-worker.new.$$"
-  [ ! -e "$staged" ] || fail "Temporary install path already exists."
-  install -m 700 "$tmp" "$staged"
-  mv "$staged" "$destination"
-  staged=""
-  printf 'PASS: updated independent Trnje worker at %s\n' "$destination"
-  printf 'BACKUP: %s\n' "$backup"
-else
-  install -m 700 "$tmp" "$destination"
-  printf 'PASS: installed independent Trnje worker at %s\n' "$destination"
+  for destination in "${destinations[@]}"; do
+    if [ -f "$destination" ]; then
+      backup="$backup_dir/$(basename "$destination").$stamp.bak"
+      [ ! -e "$backup" ] || fail "Backup already exists; refusing to overwrite it: $backup"
+      cp -p "$destination" "$backup"
+      printf 'BACKUP: %s\n' "$backup"
+    fi
+  done
 fi
-printf 'No Trnje or Emberlane repository files were changed.\n'
-printf 'Restart the existing tmux pane after update to load the new code.\n'
+
+queue_staged="$bin_dir/.trnje_api_queue.new.$$"
+mcp_staged="$bin_dir/.trnje_mcp_http.new.$$"
+worker_staged="$bin_dir/.trnje-worker.new.$$"
+for staged in "$queue_staged" "$mcp_staged" "$worker_staged"; do
+  [ ! -e "$staged" ] && [ ! -L "$staged" ] || fail "Temporary install path already exists: $staged"
+done
+
+install -m 600 "$queue_tmp" "$queue_staged"
+install -m 600 "$mcp_tmp" "$mcp_staged"
+install -m 700 "$worker_tmp" "$worker_staged"
+
+# Install dependencies first and the importing worker last.
+mv "$queue_staged" "$queue_destination"
+queue_staged=""
+mv "$mcp_staged" "$mcp_destination"
+mcp_staged=""
+mv "$worker_staged" "$worker_destination"
+worker_staged=""
+
+printf 'PASS: installed TRNJE worker and MCP modules from %s\n' "$worker_ref"
+printf 'WORKER_SHA256: %s\n' "$actual_worker_sha256"
+printf 'QUEUE_SHA256: %s\n' "$actual_queue_sha256"
+printf 'MCP_SHA256: %s\n' "$actual_mcp_sha256"
+printf 'No repository, task state, worker lock, or running process was changed.\n'
+printf 'The existing worker is not restarted automatically.\n'
