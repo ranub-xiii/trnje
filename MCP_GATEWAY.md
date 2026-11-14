@@ -46,7 +46,7 @@ The selected Authorization Server must:
 5. Expose an RFC 7662 token-introspection endpoint that accepts the configured confidential resource-server client credentials and returns `active`, `aud`, and `scope` (plus `iss`, `exp`, and `nbf` when available).
 6. Grant only `trnje:read` and `trnje:write` to the intended user/client.
 
-The TRNJE resource server calls introspection for each protected MCP request. It rejects inactive tokens, an incorrect audience, an issuer mismatch when `iss` is returned, expired/not-yet-valid tokens, and missing scopes. A provider that only supplies self-contained JWT verification and has no compatible introspection endpoint is not directly compatible with this build. Do not replace this check with a static bearer token.
+The TRNJE resource server calls introspection for each protected MCP request. It rejects inactive tokens, an incorrect audience, an issuer mismatch when `iss` is returned, and expired/not-yet-valid tokens. An invalid token returns `401`; a valid token missing the operation's required scope returns `403` with an `insufficient_scope` challenge; introspection outage or malformed provider response returns `503` with a short `Retry-After`. A provider that only supplies self-contained JWT verification and has no compatible introspection endpoint is not directly compatible with this build. Do not replace this check with a static bearer token.
 
 The required configuration values are supplied through the worker's protected environment, not committed to the repository:
 
@@ -70,12 +70,21 @@ The public host must match the URL configured at the Authorization Server and th
 
 The server exposes unauthenticated discovery at:
 
-- `GET /.well-known/oauth-protected-resource`
-- `GET /.well-known/oauth-protected-resource/mcp`
+- `GET /.well-known/oauth-protected-resource/mcp` (the path-aware resource metadata URL used in authorization challenges)
+- `GET /.well-known/oauth-protected-resource` (root compatibility alias)
 
 The metadata identifies `/mcp` as the resource, advertises the configured issuer as the authorization server, and lists the supported scopes.
 
 The MCP endpoint is `POST /mcp`. `GET /mcp` is rejected. `/health` returns only a minimal service status; it is not a task interface.
+
+### Protocol compatibility
+
+The server is dual-era:
+
+- Modern clients use protocol `2026-07-28`. Every POST must include `MCP-Protocol-Version` matching `params._meta["io.modelcontextprotocol/protocolVersion"]`, and `Mcp-Method` matching the JSON-RPC method. Calls to `tools/call`, `resources/read`, and `prompts/get` also require a matching `Mcp-Name` header. The server validates these values before processing the request.
+- Modern clients can call `server/discover` to retrieve the supported modern version, server identity and capabilities. The modern path does not use an `initialize` handshake or protocol-level sessions.
+- Legacy clients using `2025-11-25`, `2025-06-18`, or `2025-03-26` retain the initialization-based flow. A legacy `initialize` request must select one of those legacy versions.
+- CORS preflight allows the standard modern MCP request headers. Browser Origins remain opt-in and must be exact HTTPS origins.
 
 ## Cloudflare Tunnel boundary
 
