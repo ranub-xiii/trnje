@@ -251,6 +251,25 @@ def test_initialize_and_tools_list_follow_json_rpc(running_server):
     }
 
 
+def test_modern_tool_call_requires_name_header(running_server):
+    status, _, body = request(
+        running_server, tool_call("trnje_health", {}),
+        header_overrides={"Mcp-Name": None},
+    )
+    assert status == 400
+    assert json.loads(body)["error"]["code"] == -32020
+
+
+def test_legacy_tools_list_remains_available(running_server):
+    legacy = rpc("tools/list", modern=False)
+    status, _, body = request(
+        running_server, legacy,
+        header_overrides={"MCP-Protocol-Version": "2025-11-25"},
+    )
+    assert status == 200
+    assert json.loads(body)["result"]["tools"]
+
+
 def test_submit_is_durable_and_returns_without_running(running_server):
     status, _, body = request(
         running_server,
@@ -427,7 +446,7 @@ def test_notifications_return_202_without_body(running_server):
 
 def test_unknown_json_rpc_method_returns_method_not_found(running_server):
     status, _, body = request(running_server, rpc("no/such-method"))
-    assert status == 200
+    assert status == 404
     assert json.loads(body)["error"]["code"] == -32601
 
 
