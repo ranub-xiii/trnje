@@ -42,7 +42,7 @@ The selected Authorization Server must:
 1. Support Authorization Code with PKCE using `S256` for the MCP client.
 2. Publish authorization-server metadata (RFC 8414 or OpenID Connect discovery).
 3. Support the MCP client's registration/discovery requirements (Client ID Metadata Documents or a compatible Dynamic Client Registration flow).
-4. Issue access tokens for this resource with the exact audience `https://<public-host>/mcp`.
+4. Issue access tokens with the exact resource audience configured in `TRNJE_OAUTH_AUDIENCE`. In direct mode this defaults to `https://<public-host>/mcp`. If a trusted tunnel or proxy rewrites the connector-facing resource URL, configure the exact rewritten resource URL as the audience; do not accept multiple audience aliases.
 5. Expose an RFC 7662 token-introspection endpoint that accepts the configured confidential resource-server client credentials and returns `active`, `aud`, and `scope` (plus `iss`, `exp`, and `nbf` when available).
 6. Grant only `trnje:read` and `trnje:write` to the intended user/client.
 
@@ -60,11 +60,11 @@ The required configuration values are supplied through the worker's protected en
 | `TRNJE_OAUTH_INTROSPECTION_URL` | HTTPS RFC 7662 endpoint |
 | `TRNJE_OAUTH_CLIENT_ID` | Confidential resource-server client ID |
 | `TRNJE_OAUTH_CLIENT_SECRET` | Confidential resource-server secret; never commit it |
-| `TRNJE_OAUTH_AUDIENCE` | `https://trnje.example.com/mcp` |
+| `TRNJE_OAUTH_AUDIENCE` | Exact token `aud`; defaults to `https://trnje.example.com/mcp` in direct mode. For a resource-rewriting tunnel, set the exact tunnel resource URL, including its tunnel ID. |
 | `TRNJE_MCP_ALLOWED_HOSTS` | Comma-separated exact hosts, e.g. `trnje.example.com,127.0.0.1,localhost` |
 | `TRNJE_MCP_ALLOWED_ORIGINS` | Exact trusted HTTPS browser origins; leave empty for native clients without an Origin header |
 
-The public host must match the URL configured at the Authorization Server and the resource metadata document. Do not add wildcard hosts or wildcard browser origins. The listener refuses any bind address other than `127.0.0.1`.
+The public host is the upstream MCP origin used to build Protected Resource Metadata. The token audience is configured independently: it must exactly match the resource URL used by the client and returned in introspection. Keep one exact expected audience; do not add wildcard or fallback audience aliases. For a tunnel that rewrites the resource URL, use that tunnel URL (including its tunnel ID) for `TRNJE_OAUTH_AUDIENCE` while keeping `TRNJE_PUBLIC_BASE_URL` set to the upstream MCP origin. Do not add wildcard hosts or wildcard browser origins. The listener refuses any bind address other than `127.0.0.1`.
 
 ## Protected Resource Metadata and endpoints
 
