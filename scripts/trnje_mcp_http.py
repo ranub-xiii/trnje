@@ -113,10 +113,9 @@ class MCPConfig:
             "TRNJE_OAUTH_AUDIENCE",
             allow_path=True,
         ).rstrip("/")
-        if audience != public_base + "/mcp":
-            raise MCPConfigurationError(
-                "TRNJE_OAUTH_AUDIENCE must exactly match TRNJE_PUBLIC_BASE_URL + /mcp."
-            )
+        # This may differ from the upstream PRMD resource when a trusted
+        # tunnel rewrites the connector-facing resource URL. Introspection
+        # still compares the token audience to this exact configured value.
 
         origins = tuple(
             item.strip().rstrip("/")
