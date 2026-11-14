@@ -564,19 +564,24 @@ def test_oauth_allowed_hosts_reject_wildcards(monkeypatch):
         MCPConfig.from_env()
 
 
-def test_oauth_audience_must_match_the_advertised_mcp_resource(monkeypatch):
+def test_oauth_audience_can_be_configured_independently_of_upstream_resource(monkeypatch):
     values = {
         "TRNJE_PUBLIC_BASE_URL": "https://trnje.example",
         "TRNJE_OAUTH_ISSUER": "https://auth.example",
         "TRNJE_OAUTH_INTROSPECTION_URL": "https://auth.example/introspect",
         "TRNJE_OAUTH_CLIENT_ID": "client",
         "TRNJE_OAUTH_CLIENT_SECRET": "secret",
-        "TRNJE_OAUTH_AUDIENCE": "https://other.example/mcp",
+        "TRNJE_OAUTH_AUDIENCE": "https://tunnel.example/v1/mcp/tunnel_0123456789abcdef0123456789abcdef",
     }
     for key, value in values.items():
         monkeypatch.setenv(key, value)
-    with pytest.raises(MCPConfigurationError):
-        MCPConfig.from_env()
+
+    config = MCPConfig.from_env()
+
+    assert config.resource_url == "https://trnje.example/mcp"
+    assert config.audience == (
+        "https://tunnel.example/v1/mcp/tunnel_0123456789abcdef0123456789abcdef"
+    )
 
 
 class FakeResponse:
