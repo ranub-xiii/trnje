@@ -56,7 +56,7 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-# The repository is private: fetch through the authenticated GitHub CLI API.
+# Fetch the pinned worker from GitHub at the selected ref.
 gh api "repos/ranub-xiii/trnje/contents/scripts/trnje_termux_worker.py?ref=${worker_ref}" --jq .content |
   python -c 'import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))' > "$tmp"
 
