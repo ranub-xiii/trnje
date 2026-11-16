@@ -3,7 +3,7 @@ name: Tests
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, ci/restore-main-tests-20261116]
 
 permissions:
   contents: read
