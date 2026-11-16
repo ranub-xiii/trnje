@@ -19,14 +19,15 @@ The command uses a bounded timeout and token count, emits a JSON result, and ret
 
 ## Minimal task loop (experimental)
 
-The first task loop is intentionally narrow: it inspects one explicitly selected file, asks the local model for one exact text replacement, applies it only if the old text matches exactly once, and runs the fixed repository checks. It does not retry, run model-supplied shell commands, commit, push, or merge. If verification fails after an edit, the changed file is left in place and the JSON report says so; inspect the diff before continuing.
+The first task loop is intentionally narrow: it inspects one explicitly selected file, asks the local model for one exact text replacement, applies it only if the old text matches exactly once, and runs the fixed repository checks. It does not retry, run model-supplied shell commands, commit, push, or merge. If post-edit verification is blocked, the loop attempts a guarded rollback and restores the original file only if the current content still matches the exact edit it made; otherwise it refuses to overwrite a concurrent change. Review the JSON report and diff before continuing.
 
 ```bash
 export TRNJE_MODEL_PATH="$HOME/models/qwen2.5-coder-0.5b-instruct-q4_0.gguf"
 python scripts/run_task.py \
   --workspace "$HOME/trnje" \
   --file "path/inside/project.py" \
-  --task "Describe one small, testable correction"
+  --task "Describe one small, testable correction" \
+  --expect "Exact text that must appear after the edit"
 ```
 
 Use a real relative path and a narrow task. This is an experimental one-file loop, not proof of full autonomous coding capability. Its output is a JSON report; exit code 0 means the fixed checks passed, not that the task was independently judged correct.
