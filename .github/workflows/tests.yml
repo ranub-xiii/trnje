@@ -1,0 +1,62 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main, ci/restore-main-tests-20261116]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install test dependencies when tests exist
+        shell: bash
+        run: |
+          if find . -type f -name 'test_*.py' -not -path './.git/*' -print -quit | grep -q .; then
+            python -m pip install --disable-pip-version-check pytest "mcp==2.3.0"
+          else
+            echo "::notice::No Python test files exist on this ref; dependency installation skipped."
+          fi
+      - name: Run Python tests when present
+        shell: bash
+        run: |
+          if find . -type f -name 'test_*.py' -not -path './.git/*' -print -quit | grep -q .; then
+            python -m pytest -q
+          else
+            echo "::notice::No Python tests exist on this ref; no test result is claimed."
+          fi
+      - name: Compile Python source when present
+        run: |
+          python - <<'PY'
+          import compileall
+          from pathlib import Path
+
+          roots = [Path(name) for name in ("trnje", "scripts", "tests") if Path(name).is_dir()]
+          python_files = [path for root in roots for path in root.rglob("*.py")]
+          if not python_files:
+              print("No Python source files found; compilation skipped.")
+          else:
+              failed = [str(root) for root in roots if not compileall.compile_dir(root, quiet=1)]
+              if failed:
+                  raise SystemExit("Compilation failed: " + ", ".join(failed))
+              print(f"Compiled Python sources under: {', '.join(map(str, roots))}")
+          PY
+      - name: Validate shell script syntax
+        shell: bash
+        run: |
+          mapfile -t scripts < <(find scripts -type f -name '*.sh' -print | sort)
+          if (("${#scripts[@]}" == 0)); then
+            echo "::error::No shell scripts found under scripts/."
+            exit 1
+          fi
+          bash -n "${scripts[@]}"
