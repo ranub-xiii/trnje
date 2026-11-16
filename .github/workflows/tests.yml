@@ -22,7 +22,7 @@ jobs:
       - name: Install test dependencies when tests exist
         shell: bash
         run: |
-          if find . -path './.git' -prune -o -type f \\( -name 'test_*.py' -o -name '*_test.py' \\) -print -quit | grep -q .; then
+          if find . -type f -name 'test_*.py' -not -path './.git/*' -print -quit | grep -q .; then
             python -m pip install --disable-pip-version-check pytest "mcp==2.3.0"
           else
             echo "::notice::No Python test files exist on this ref; dependency installation skipped."
@@ -30,7 +30,7 @@ jobs:
       - name: Run Python tests when present
         shell: bash
         run: |
-          if find . -path './.git' -prune -o -type f \\( -name 'test_*.py' -o -name '*_test.py' \\) -print -quit | grep -q .; then
+          if find . -type f -name 'test_*.py' -not -path './.git/*' -print -quit | grep -q .; then
             python -m pytest -q
           else
             echo "::notice::No Python tests exist on this ref; no test result is claimed."
